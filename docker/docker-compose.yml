@@ -1,0 +1,13 @@
+name: dh-bookbuilder-docker
+services:
+  deephaven:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile
+    ports:
+      - '${DEEPHAVEN_PORT:-20000}:10000'
+    volumes:
+      - ./data:/data
+    environment:
+      - PYTHONPATH=${PYTHONPATH}:/data/storage/notebooks
+      - START_OPTS=-Xmx40g -DAuthHandlers=io.deephaven.auth.AnonymousAuthenticationHandler

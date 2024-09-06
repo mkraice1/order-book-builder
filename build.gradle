@@ -1,0 +1,44 @@
+plugins {
+    id 'groovy'
+    id 'java-library'
+    id 'idea'
+}
+
+group 'io.deephaven'
+version "1.0-${dhcVersion}"
+
+allprojects {
+    repositories {
+        mavenCentral()
+    }
+}
+
+tasks.wrapper {
+    Wrapper w ->
+        w.gradleVersion = '8.9'
+        w.distributionType = 'ALL'
+}
+
+java {
+    withSourcesJar()
+    withJavadocJar()
+}
+
+dependencies {
+    implementation platform("io.deephaven:deephaven-bom:${dhcVersion}"),
+                   "io.deephaven:deephaven-engine-table",
+                   "it.unimi.dsi:fastutil:8.5.13"
+    runtimeOnly "io.deephaven:deephaven-log-to-slf4j",
+                'ch.qos.logback:logback-classic:1.4.5'
+}
+
+jar {
+    manifest {
+        attributes 'Implementation-Title': 'deephaven-pricebook',
+                'Implementation-Version': version,
+                'Provider': 'gradle',
+                'VCS-Branch': "${ -> ext.vcsRevision = 'git rev-parse --abbrev-ref HEAD'.execute(null, rootDir).text.trim()}",
+                'VCS-Revision': "${ -> ext.vcsBranch = 'git rev-list --max-count=1 HEAD'.execute(null, rootDir).text.trim()}",
+                'Build-Date' : new Date()
+    }
+}

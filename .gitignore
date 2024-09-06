@@ -1,0 +1,13 @@
+# exclusions below were generated automatically; remove this comment to regenerate exclusions.
+**/gen
+.idea/
+build/
+buildTest/
+out/
+outTest/
+.gradle/
+*.ipr
+*.iws
+*.iml
+tmp/
+**/.DS_Store
