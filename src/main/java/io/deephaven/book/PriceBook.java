@@ -7,9 +7,8 @@ import io.deephaven.chunk.attributes.Values;
 import io.deephaven.engine.rowset.*;
 import io.deephaven.engine.table.*;
 import io.deephaven.engine.table.impl.*;
-import io.deephaven.engine.table.impl.sources.DoubleArraySource;
+import io.deephaven.engine.table.impl.sources.ArrayBackedColumnSource;
 import io.deephaven.engine.table.impl.sources.InstantArraySource;
-import io.deephaven.engine.table.impl.sources.IntegerArraySource;
 import io.deephaven.engine.table.impl.sources.ObjectArraySource;
 import io.deephaven.util.SafeCloseable;
 import it.unimi.dsi.fastutil.doubles.Double2IntOpenHashMap;
@@ -17,8 +16,6 @@ import it.unimi.dsi.fastutil.doubles.Double2LongOpenHashMap;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.*;
-
-import static io.deephaven.util.QueryConstants.*;
 
 /**
  * <p>Build a book of the top N Bid/Ask prices in a columnar book format.</p>
@@ -71,7 +68,7 @@ public class PriceBook {
     private final ColumnSource<Integer> sideSource;
     private final ColumnSource<Integer> opSource;
 
-    private final ChunkSource.WithPrev<Values> keySource;
+    private final TupleSource keySource;
     // endregion
 
     // region OutputSources
@@ -79,12 +76,16 @@ public class PriceBook {
     final BookListener bookListener;
 
     final TrackingWritableRowSet resultIndex;
+
+    final WritableColumnSource[] keyOutputSources;
     final InstantArraySource timeResult;
-    @SuppressWarnings("rawtypes")
-    final ObjectArraySource keyResult;
-    final DoubleArraySource[] priceResults;
-    final InstantArraySource[] timeResults;
-    final IntegerArraySource[] sizeResults;
+    final ObjectArraySource<double[]> bidPriceResults;
+    final ObjectArraySource<long[]> bidTimeResults;
+    final ObjectArraySource<int[]> bidSizeResults;
+
+    final ObjectArraySource<double[]> askPriceResults;
+    final ObjectArraySource<long[]> askTimeResults;
+    final ObjectArraySource<int[]> askSizeResults;
 
     // endregion
 
@@ -122,31 +123,29 @@ public class PriceBook {
         timeResult = new InstantArraySource();
         columnSourceMap.put("Timestamp", timeResult);
 
-        keyResult = new ObjectArraySource<>(Object.class);
-        columnSourceMap.put("Key", keyResult);
+        keyOutputSources = new WritableColumnSource[groupingCols.length];
+        for(int ii = 0; ii < groupingCols.length; ii++) {
+            final String groupingColName = groupingCols[ii];
+            final ColumnSource<?> gsCol = source.getColumnSource(groupingColName);
+            keyOutputSources[ii] = ArrayBackedColumnSource.getMemoryColumnSource(gsCol.getType(), gsCol.getComponentType());
+            columnSourceMap.put(groupingColName, keyOutputSources[ii]);
+        }
 
         // The number of Price/Timestamp/Size columns is twice the requested book depth,  one set for
         // bids, and one set for asks.
-        priceResults = new DoubleArraySource[2 * depth];
-        timeResults = new InstantArraySource[2 * depth];
-        sizeResults = new IntegerArraySource[2 * depth];
+        bidPriceResults = new ObjectArraySource<>(double[].class);
+        bidTimeResults = new ObjectArraySource<>(long[].class);
+        bidSizeResults = new ObjectArraySource<>(int[].class);
+        columnSourceMap.put("Bid_Price", bidPriceResults);
+        columnSourceMap.put("Bid_Timestamp", bidTimeResults);
+        columnSourceMap.put("Bid_Size", bidSizeResults);
 
-        // Create each one iteratively, generate the name, and stuff them into the result column source map.
-        for(int ii = 0; ii < 2 * depth; ii++) {
-            final String prefix = ii < depth ? "Bid" : "Ask";
-            final String suffix = Integer.toString((ii % depth) + 1);
-            final InstantArraySource ts = new InstantArraySource();
-            timeResults[ii] = ts;
-            columnSourceMap.put(prefix+"_Timestamp"+ suffix, ts);
-
-            final DoubleArraySource ps = new DoubleArraySource();
-            priceResults[ii] = ps;
-            columnSourceMap.put(prefix+"_Price"+suffix, ps);
-
-            final IntegerArraySource ss = new IntegerArraySource();
-            sizeResults[ii] = ss;
-            columnSourceMap.put(prefix+"_Size"+suffix, ss);
-        }
+        askPriceResults = new ObjectArraySource<>(double[].class);
+        askTimeResults = new ObjectArraySource<>(long[].class);
+        askSizeResults = new ObjectArraySource<>(int[].class);
+        columnSourceMap.put("Ask_Price", askPriceResults);
+        columnSourceMap.put("Ask_Timestamp", askTimeResults);
+        columnSourceMap.put("Ask_Size", askSizeResults);
 
         // Finally, create the result table for the user
         final OperationSnapshotControl snapshotControl =
@@ -324,15 +323,18 @@ public class PriceBook {
         timeResult.ensureCapacity(newSize);
         timeResult.set(nextIndex, timestamp);
 
-        keyResult.ensureCapacity(newSize);
-        //noinspection unchecked
-        keyResult.set(nextIndex, key);
+        for(int ii = 0; ii < keyOutputSources.length; ii++) {
+            keyOutputSources[ii].ensureCapacity(newSize);
+            keyOutputSources[ii].set(nextIndex, keySource.exportElement(key, ii));
+        }
 
         // Fill out the bid columns
-        fillFrom(0, depth, nextIndex, newSize, state.bids, ctx, Comparator.reverseOrder());
+        fillFrom(nextIndex, newSize, state.bids, ctx, Comparator.reverseOrder(),
+                bidPriceResults, bidTimeResults, bidSizeResults);
 
         // Fill out the ask columns
-        fillFrom(depth, depth, nextIndex, newSize, state.asks, ctx, Comparator.naturalOrder());
+        fillFrom(nextIndex, newSize, state.asks, ctx, Comparator.naturalOrder(),
+                askPriceResults, askTimeResults, askSizeResults);
 
         // Increment the number of rows added.
         ctx.rowsAdded++;
@@ -342,45 +344,43 @@ public class PriceBook {
      * Fill out a set of timestamp/price/size columns in order.  These columns were created in order in the constructor
      * for all bids, and then asks,  so we can just walk 'depth' times to write out the prices.
      *
-     * @param start the starting index of best prices
-     * @param count the number of prices to write
      * @param destination the destination row to write to in the output table
      * @param newSize the new table size for ensureCapcity
      * @param book the book to source data from
      * @param ctx the shared context
      * @param comparator the comparator for sorting the prices properly.
      */
-    private void fillFrom(int start, int count, long destination, long newSize, Book book, Context ctx, Comparator<? super Double> comparator) {
+    private void fillFrom(long destination,
+                          long newSize,
+                          Book book,
+                          Context ctx,
+                          Comparator<? super Double> comparator,
+                          WritableColumnSource<double[]> priceDestination,
+                          WritableColumnSource<long[]> timeDestination,
+                          WritableColumnSource<int[]> sizeDestination) {
+        final int count = book.bestPrices.size();
+        final double[] prices = new double[count];
+        final long[] times = new long[count];
+        final int[] sizes = new int[count];
         // First copy the best prices from the book into our temporary array and sort it appropriately
         Arrays.sort(book.bestPrices.toArray(ctx.priceBuf), 0, book.bestPrices.size(), comparator);
 
         // Then, once for each price level  write out the timestamp, size, and price of that particular order from the book.
-        for(int ii = start; ii < start + count; ii++) {
-            final double price;
-            final int size;
-            final long time;
-
-            // Select the values to be written.  Initially, the book may not be fully populated so we will
-            // use NULL values for each type for the remaining values.
-            if(ii - start < book.bestPrices.size()) {
-                price = ctx.priceBuf[ii-start];
-                time = book.timestampMap.get(price);
-                size = book.sizeMap.get(price);
-            } else {
-                price = NULL_DOUBLE;
-                time = NULL_LONG;
-                size = NULL_INT;
-            }
-
-            priceResults[ii].ensureCapacity(newSize);
-            priceResults[ii].set(destination, price);
-
-            timeResults[ii].ensureCapacity(newSize);
-            timeResults[ii].set(destination, time);
-
-            sizeResults[ii].ensureCapacity(newSize);
-            sizeResults[ii].set(destination, size);
+        for(int ii = 0; ii < count; ii++) {
+            final double price = ctx.priceBuf[ii];
+            prices[ii] = price;
+            times[ii] = book.timestampMap.get(price);
+            sizes[ii] = book.sizeMap.get(price);
         }
+
+        priceDestination.ensureCapacity(newSize);
+        priceDestination.set(destination, prices);
+
+        timeDestination.ensureCapacity(newSize);
+        timeDestination.set(destination, times);
+
+        sizeDestination.ensureCapacity(newSize);
+        sizeDestination.set(destination, sizes);
     }
 
     /**
