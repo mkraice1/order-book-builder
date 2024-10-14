@@ -7,10 +7,10 @@ import io.deephaven.chunk.attributes.Values;
 import io.deephaven.engine.rowset.*;
 import io.deephaven.engine.table.*;
 import io.deephaven.engine.table.impl.*;
+import io.deephaven.engine.table.impl.sources.ArrayBackedColumnSource;
 import io.deephaven.engine.table.impl.sources.DoubleArraySource;
 import io.deephaven.engine.table.impl.sources.InstantArraySource;
 import io.deephaven.engine.table.impl.sources.IntegerArraySource;
-import io.deephaven.engine.table.impl.sources.ObjectArraySource;
 import io.deephaven.util.SafeCloseable;
 import it.unimi.dsi.fastutil.doubles.Double2IntOpenHashMap;
 import it.unimi.dsi.fastutil.doubles.Double2LongOpenHashMap;
@@ -71,7 +71,7 @@ public class PriceBook {
     private final ColumnSource<Integer> sideSource;
     private final ColumnSource<Integer> opSource;
 
-    private final ChunkSource.WithPrev<Values> keySource;
+    private final TupleSource keySource;
     // endregion
 
     // region OutputSources
@@ -79,9 +79,9 @@ public class PriceBook {
     final BookListener bookListener;
 
     final TrackingWritableRowSet resultIndex;
+
+    final WritableColumnSource[] keyOutputSources;
     final InstantArraySource timeResult;
-    @SuppressWarnings("rawtypes")
-    final ObjectArraySource keyResult;
     final DoubleArraySource[] priceResults;
     final InstantArraySource[] timeResults;
     final IntegerArraySource[] sizeResults;
@@ -122,8 +122,13 @@ public class PriceBook {
         timeResult = new InstantArraySource();
         columnSourceMap.put("Timestamp", timeResult);
 
-        keyResult = new ObjectArraySource<>(Object.class);
-        columnSourceMap.put("Key", keyResult);
+        keyOutputSources = new WritableColumnSource[groupingCols.length];
+        for(int ii = 0; ii < groupingCols.length; ii++) {
+            final String groupingColName = groupingCols[ii];
+            final ColumnSource<?> gsCol = source.getColumnSource(groupingColName);
+            keyOutputSources[ii] = ArrayBackedColumnSource.getMemoryColumnSource(gsCol.getType(), gsCol.getComponentType());
+            columnSourceMap.put(groupingColName, keyOutputSources[ii]);
+        }
 
         // The number of Price/Timestamp/Size columns is twice the requested book depth,  one set for
         // bids, and one set for asks.
@@ -324,9 +329,10 @@ public class PriceBook {
         timeResult.ensureCapacity(newSize);
         timeResult.set(nextIndex, timestamp);
 
-        keyResult.ensureCapacity(newSize);
-        //noinspection unchecked
-        keyResult.set(nextIndex, key);
+        for(int ii = 0; ii < keyOutputSources.length; ii++) {
+            keyOutputSources[ii].ensureCapacity(newSize);
+            keyOutputSources[ii].set(nextIndex, keySource.exportElement(key, ii));
+        }
 
         // Fill out the bid columns
         fillFrom(0, depth, nextIndex, newSize, state.bids, ctx, Comparator.reverseOrder());
