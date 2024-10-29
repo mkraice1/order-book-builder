@@ -97,7 +97,7 @@ public class PriceBook {
 
     private final boolean sourceIsBlink;
 
-    // TODO: Add nullable table for snapshot
+    // TODO: Add constructor that uses snapshot
 
     private PriceBook(@NotNull final Table table,
                       final int depth,
@@ -137,7 +137,7 @@ public class PriceBook {
         timeResult = new InstantArraySource();
         columnSourceMap.put("Timestamp", timeResult);
 
-        // TODO: Shouldn't need to do ths?
+        // Shouldn't need to do ths?
         keyOutputSources = new WritableColumnSource[groupingCols.length];
         for(int ii = 0; ii < groupingCols.length; ii++) {
             final String groupingColName = groupingCols[ii];
@@ -623,10 +623,6 @@ public class PriceBook {
             asks = new Book(depth, Comparator.naturalOrder());
         }
 
-
-        // TODO: another constructor here to use a snapshot
-        // Take 2 cols or arrs and make 2 Books
-
         /**
          * Update the book state with the specified price.  If the book op was DELETE or REMOVE, or the size was 0
          * the price will be removed from the book.
@@ -638,7 +634,6 @@ public class PriceBook {
          * @param op the book op
          * @return true if the price resulted in a book update
          */
-        // TODO: add other ops here
         public boolean update(final long time,
                               final double price,
                               final int size,
