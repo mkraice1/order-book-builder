@@ -8,17 +8,17 @@ import io.deephaven.engine.rowset.*;
 import io.deephaven.engine.table.*;
 import io.deephaven.engine.table.impl.*;
 import io.deephaven.engine.table.impl.sources.ArrayBackedColumnSource;
-import io.deephaven.engine.table.impl.sources.DoubleArraySource;
 import io.deephaven.engine.table.impl.sources.InstantArraySource;
-import io.deephaven.engine.table.impl.sources.IntegerArraySource;
+import io.deephaven.engine.table.impl.sources.ObjectArraySource;
 import io.deephaven.util.SafeCloseable;
 import it.unimi.dsi.fastutil.doubles.Double2IntOpenHashMap;
 import it.unimi.dsi.fastutil.doubles.Double2LongOpenHashMap;
 import org.jetbrains.annotations.NotNull;
+import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
+
+import io.deephaven.tuple.ArrayTuple;
 
 import java.util.*;
-
-import static io.deephaven.util.QueryConstants.*;
 
 /**
  * <p>Build a book of the top N Bid/Ask prices in a columnar book format.</p>
@@ -54,11 +54,14 @@ import static io.deephaven.util.QueryConstants.*;
  */
 public class PriceBook {
     private static final int CHUNK_SIZE = 2048;
-    private static final int SIDE_BUY = 0;
-    private static final int SIDE_SELL = 1;
+    private static final int SIDE_BUY = 1;
+    private static final int SIDE_SELL = 2;
 
     private static final int OP_INSERT = 1;
     private static final int OP_REMOVE = 2;
+    private static final int OP_CANCEL = 3;
+    private static final int OP_INTERNAL_FILL = 4;
+    private static final int OP_AWAY_FILL = 5;
 
     private final Map<Object, BookState> states = new HashMap<>();
     private final boolean batchTimestamps;
@@ -82,13 +85,19 @@ public class PriceBook {
 
     final WritableColumnSource[] keyOutputSources;
     final InstantArraySource timeResult;
-    final DoubleArraySource[] priceResults;
-    final InstantArraySource[] timeResults;
-    final IntegerArraySource[] sizeResults;
+    final ObjectArraySource<double[]> bidPriceResults;
+    final ObjectArraySource<long[]> bidTimeResults;
+    final ObjectArraySource<int[]> bidSizeResults;
+
+    final ObjectArraySource<double[]> askPriceResults;
+    final ObjectArraySource<long[]> askTimeResults;
+    final ObjectArraySource<int[]> askSizeResults;
 
     // endregion
 
     private final boolean sourceIsBlink;
+
+    // TODO: Add nullable table for snapshot
 
     private PriceBook(@NotNull final Table table,
                       final int depth,
@@ -104,8 +113,11 @@ public class PriceBook {
         this.depth = depth;
         this.sourceIsBlink = BlinkTableTools.isBlink(source);
 
+
+        ////vv Change to do this from a snapshot from book ??  vv////
+
         // Begin by getting references to the column sources from the input table to process later.
-        this.timeSource = source.getColumnSource(timestampColumnName).reinterpret(long.class);
+        this.timeSource = ReinterpretUtils.instantToLongSource(source.getColumnSource(timestampColumnName));
         this.priceSource = source.getColumnSource(priceColumnName);
         this.sizeSource = source.getColumnSource(sizeColumnName);
         this.sideSource = source.getColumnSource(sideColumnName);
@@ -118,10 +130,14 @@ public class PriceBook {
         // Construct the new column sources and result table.
         final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
 
+        ////^^ Change to do this from a snapshot from book ??  ^^////
+
+
         // Now we create the columns which will be in the output table
         timeResult = new InstantArraySource();
         columnSourceMap.put("Timestamp", timeResult);
 
+        // TODO: Shouldn't need to do ths?
         keyOutputSources = new WritableColumnSource[groupingCols.length];
         for(int ii = 0; ii < groupingCols.length; ii++) {
             final String groupingColName = groupingCols[ii];
@@ -132,26 +148,19 @@ public class PriceBook {
 
         // The number of Price/Timestamp/Size columns is twice the requested book depth,  one set for
         // bids, and one set for asks.
-        priceResults = new DoubleArraySource[2 * depth];
-        timeResults = new InstantArraySource[2 * depth];
-        sizeResults = new IntegerArraySource[2 * depth];
+        bidPriceResults = new ObjectArraySource<>(double[].class);
+        bidTimeResults = new ObjectArraySource<>(long[].class);
+        bidSizeResults = new ObjectArraySource<>(int[].class);
+        columnSourceMap.put("Bid_Price", bidPriceResults);
+        columnSourceMap.put("Bid_Timestamp", bidTimeResults);
+        columnSourceMap.put("Bid_Size", bidSizeResults);
 
-        // Create each one iteratively, generate the name, and stuff them into the result column source map.
-        for(int ii = 0; ii < 2 * depth; ii++) {
-            final String prefix = ii < depth ? "Bid" : "Ask";
-            final String suffix = Integer.toString((ii % depth) + 1);
-            final InstantArraySource ts = new InstantArraySource();
-            timeResults[ii] = ts;
-            columnSourceMap.put(prefix+"_Timestamp"+ suffix, ts);
-
-            final DoubleArraySource ps = new DoubleArraySource();
-            priceResults[ii] = ps;
-            columnSourceMap.put(prefix+"_Price"+suffix, ps);
-
-            final IntegerArraySource ss = new IntegerArraySource();
-            sizeResults[ii] = ss;
-            columnSourceMap.put(prefix+"_Size"+suffix, ss);
-        }
+        askPriceResults = new ObjectArraySource<>(double[].class);
+        askTimeResults = new ObjectArraySource<>(long[].class);
+        askSizeResults = new ObjectArraySource<>(int[].class);
+        columnSourceMap.put("Ask_Price", askPriceResults);
+        columnSourceMap.put("Ask_Timestamp", askTimeResults);
+        columnSourceMap.put("Ask_Size", askSizeResults);
 
         // Finally, create the result table for the user
         final OperationSnapshotControl snapshotControl =
@@ -159,6 +168,8 @@ public class PriceBook {
 
         final MutableObject<QueryTable> result = new MutableObject<>();
         final MutableObject<BookListener> listenerHolder = new MutableObject<>();
+
+        // TODO: am I replacing this? or do I build from snapshot, and then do this?
         QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
                 (prevRequested, beforeClock) -> {
                     final boolean usePrev = prevRequested && source.isRefreshing();
@@ -167,9 +178,11 @@ public class PriceBook {
                     // the LTM thread and so it must know if it should use previous values or current values.
                     final long rowsAdded = processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev);
 
+                    // TODO: init from snapshot
                     final QueryTable bookTable = new QueryTable(
                             (rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1)).toTracking()
                             , columnSourceMap);
+
                     if (snapshotControl != null) {
                         columnSourceMap.values().forEach(ColumnSource::startTrackingPrevValues);
                         bookTable.setRefreshing(true);
@@ -194,7 +207,7 @@ public class PriceBook {
                     result.set(bookTable);
                     return true;
                 });
-
+        // TODO: Do I just set the snapshot to the result table?
         this.resultTable = result.get();
         this.resultIndex = resultTable.getRowSet().writableCast();
         if(source.isRefreshing()) {
@@ -311,6 +324,74 @@ public class PriceBook {
         }
     }
 
+    final Map<Object, BookState> processInitBook(final Table t, String... groupings) {
+        final Map<Object, BookState> initStates = new HashMap<>();
+
+        final ColumnSource<long[]> bidTSSource = t.getColumnSource("bid_times");
+        final ColumnSource<long[]> askTSSource = t.getColumnSource("ask_times");
+        final ColumnSource<int[]> bidSizesSource = t.getColumnSource("bid_sizes");
+        final ColumnSource<int[]> askSizesSource = t.getColumnSource("ask_sizes");
+        final ColumnSource<double[]> bidsSource = t.getColumnSource("bids");
+        final ColumnSource<double[]> asksSource = t.getColumnSource("asks");
+
+        final List<ColumnSource<?>> groupingSources = new ArrayList<>();
+        for (final String grouping : groupings) {
+            final ColumnSource<?> colSource = t.getColumnSource(grouping);
+            groupingSources.add(colSource);
+        }
+
+        try(final InitContext context = new InitContext(depth, groupingSources)) {
+            // Next we get an iterator into the added index so that we can process the update in chunks.
+            final RowSequence.Iterator okit = t.getRowSet().getRowSequenceIterator();
+
+            final ChunkSource.FillContext bidTimeFc = context.makeFillContext(bidTSSource);
+            final ChunkSource.FillContext askTimeFc = context.makeFillContext(askTSSource);
+            final ChunkSource.FillContext bidSizeFc = context.makeFillContext(bidSizesSource);
+            final ChunkSource.FillContext askSizeFc = context.makeFillContext(askSizesSource);
+            final ChunkSource.FillContext bidPriceFc = context.makeFillContext(bidsSource);
+            final ChunkSource.FillContext askPriceFc = context.makeFillContext(asksSource);
+            final ChunkSource.FillContext[] groupingfc = new ChunkSource.FillContext[groupingSources.size()];
+            for (int i = 0; i < groupingSources.size(); i++) {
+                groupingfc[i] = context.makeFillContext(groupingSources.get(i));
+            }
+
+            while (okit.hasMore()) {
+                context.sc.reset();
+
+                // Grab up to the next CHUNK_SIZE rows
+                final RowSequence nextKeys = okit.getNextRowSequenceWithLength(CHUNK_SIZE);
+
+                bidTSSource.fillChunk(bidTimeFc, (WritableChunk<? super Values>) context.bidTimeChunk, nextKeys);
+                askTSSource.fillChunk(askTimeFc, (WritableChunk<? super Values>) context.askTimeChunk, nextKeys);
+                bidSizesSource.fillChunk(bidSizeFc, (WritableChunk<? super Values>) context.bidSizeChunk, nextKeys);
+                askSizesSource.fillChunk(askSizeFc, (WritableChunk<? super Values>) context.askSizeChunk, nextKeys);
+                bidsSource.fillChunk(bidPriceFc, (WritableChunk<? super Values>) context.bidPriceChunk, nextKeys);
+                asksSource.fillChunk(askPriceFc, (WritableChunk<? super Values>) context.askPriceChunk, nextKeys);
+
+                for (int i = 0; i < groupingSources.size(); i++) {
+                    groupingSources.get(i).fillChunk(groupingfc[i], (WritableChunk<? super Values>) context.groupingChunks.get(i), nextKeys);
+                }
+
+                for (int ii = 0; ii < nextKeys.size(); ii++) {
+                    final int finalII = ii;
+                    final ArrayTuple key = new ArrayTuple(context.groupingChunks.stream()
+                            .map(c -> c.get(finalII)).toArray(Object[]::new));
+
+                    initStates.put(key, new BookState(depth,
+                            context.bidTimeChunk.get(ii),
+                            context.askTimeChunk.get(ii),
+                            context.bidSizeChunk.get(ii),
+                            context.askSizeChunk.get(ii),
+                            context.bidPriceChunk.get(ii),
+                            context.askPriceChunk.get(ii)
+                            ));
+                }
+            }
+        }
+
+        return initStates;
+    }
+
     /**
      * Write out a single row of updates to the output table.
      *
@@ -335,10 +416,12 @@ public class PriceBook {
         }
 
         // Fill out the bid columns
-        fillFrom(0, depth, nextIndex, newSize, state.bids, ctx, Comparator.reverseOrder());
+        fillFrom(nextIndex, newSize, state.bids, ctx, Comparator.reverseOrder(),
+                bidPriceResults, bidTimeResults, bidSizeResults);
 
         // Fill out the ask columns
-        fillFrom(depth, depth, nextIndex, newSize, state.asks, ctx, Comparator.naturalOrder());
+        fillFrom(nextIndex, newSize, state.asks, ctx, Comparator.naturalOrder(),
+                askPriceResults, askTimeResults, askSizeResults);
 
         // Increment the number of rows added.
         ctx.rowsAdded++;
@@ -348,45 +431,43 @@ public class PriceBook {
      * Fill out a set of timestamp/price/size columns in order.  These columns were created in order in the constructor
      * for all bids, and then asks,  so we can just walk 'depth' times to write out the prices.
      *
-     * @param start the starting index of best prices
-     * @param count the number of prices to write
      * @param destination the destination row to write to in the output table
      * @param newSize the new table size for ensureCapcity
      * @param book the book to source data from
      * @param ctx the shared context
      * @param comparator the comparator for sorting the prices properly.
      */
-    private void fillFrom(int start, int count, long destination, long newSize, Book book, Context ctx, Comparator<? super Double> comparator) {
+    private void fillFrom(long destination,
+                          long newSize,
+                          Book book,
+                          Context ctx,
+                          Comparator<? super Double> comparator,
+                          WritableColumnSource<double[]> priceDestination,
+                          WritableColumnSource<long[]> timeDestination,
+                          WritableColumnSource<int[]> sizeDestination) {
+        final int count = book.bestPrices.size();
+        final double[] prices = new double[count];
+        final long[] times = new long[count];
+        final int[] sizes = new int[count];
         // First copy the best prices from the book into our temporary array and sort it appropriately
         Arrays.sort(book.bestPrices.toArray(ctx.priceBuf), 0, book.bestPrices.size(), comparator);
 
         // Then, once for each price level  write out the timestamp, size, and price of that particular order from the book.
-        for(int ii = start; ii < start + count; ii++) {
-            final double price;
-            final int size;
-            final long time;
-
-            // Select the values to be written.  Initially, the book may not be fully populated so we will
-            // use NULL values for each type for the remaining values.
-            if(ii - start < book.bestPrices.size()) {
-                price = ctx.priceBuf[ii-start];
-                time = book.timestampMap.get(price);
-                size = book.sizeMap.get(price);
-            } else {
-                price = NULL_DOUBLE;
-                time = NULL_LONG;
-                size = NULL_INT;
-            }
-
-            priceResults[ii].ensureCapacity(newSize);
-            priceResults[ii].set(destination, price);
-
-            timeResults[ii].ensureCapacity(newSize);
-            timeResults[ii].set(destination, time);
-
-            sizeResults[ii].ensureCapacity(newSize);
-            sizeResults[ii].set(destination, size);
+        for(int ii = 0; ii < count; ii++) {
+            final double price = ctx.priceBuf[ii];
+            prices[ii] = price;
+            times[ii] = book.timestampMap.get(price);
+            sizes[ii] = book.sizeMap.get(price);
         }
+
+        priceDestination.ensureCapacity(newSize);
+        priceDestination.set(destination, prices);
+
+        timeDestination.ensureCapacity(newSize);
+        timeDestination.set(destination, times);
+
+        sizeDestination.ensureCapacity(newSize);
+        sizeDestination.set(destination, sizes);
     }
 
     /**
@@ -401,20 +482,47 @@ public class PriceBook {
     private static class Book {
         private final MinMaxPriorityQueue<Double> bestPrices;
         private final PriorityQueue<Double> overflowPrices;
-        private final Double2IntOpenHashMap sizeMap = new Double2IntOpenHashMap();
-        private final Double2LongOpenHashMap timestampMap = new Double2LongOpenHashMap();
+        private final Double2IntOpenHashMap sizeMap;
+        private final Double2LongOpenHashMap timestampMap;
 
         private final long depth;
         private final Comparator<Double> comparator;
 
+        Book(int depth, 
+                Comparator<Double> comparator, 
+                long[] timeArr, 
+                int[] sizeArr,
+                double[] priceArr) {
+
+            this.depth = depth;
+            this.comparator = comparator;
+            this.sizeMap = new Double2IntOpenHashMap(priceArr, sizeArr);
+            this.timestampMap = new Double2LongOpenHashMap(priceArr, timeArr);
+            this.sizeMap.defaultReturnValue(-1);
+            this.timestampMap.defaultReturnValue(-1);
+
+            // Insert prices into minmax q ...
+            bestPrices = MinMaxPriorityQueue.orderedBy(comparator).maximumSize(depth).create();
+            for(int ii = 0; ii < priceArr.length; ii++) {
+                bestPrices.add(priceArr[ii]);
+            }
+
+            // Do I initialize overflow too?
+            overflowPrices = new PriorityQueue<>(comparator);
+        }
+
+
         Book(int depth, Comparator<Double> comparator) {
             this.depth = depth;
             this.comparator = comparator;
+            this.sizeMap = new Double2IntOpenHashMap();
+            this.timestampMap = new Double2LongOpenHashMap();
             this.sizeMap.defaultReturnValue(-1);
             this.timestampMap.defaultReturnValue(-1);
             bestPrices = MinMaxPriorityQueue.orderedBy(comparator).maximumSize(depth).create();
             overflowPrices = new PriorityQueue<>(comparator);
         }
+
 
         /**
          * Update the specified price in the book.  If the price was new and larger than the any of the prices in the
@@ -497,10 +605,27 @@ public class PriceBook {
         final Book bids;
         final Book asks;
 
+        BookState(int depth,
+                long[] bidTimeArr,
+                long[] askTimeArr,
+                int[] bidSizeArr,
+                int[] askSizeArr,
+                double[] bidPriceArr,
+                double[] askPriceArr ) {
+
+            bids = new Book(depth, Comparator.reverseOrder(), bidTimeArr, bidSizeArr, bidPriceArr);
+            asks = new Book(depth, Comparator.naturalOrder(), askTimeArr, askSizeArr, askPriceArr);
+         
+        }
+
         BookState(int depth) {
             bids = new Book(depth, Comparator.reverseOrder());
             asks = new Book(depth, Comparator.naturalOrder());
         }
+
+
+        // TODO: another constructor here to use a snapshot
+        // Take 2 cols or arrs and make 2 Books
 
         /**
          * Update the book state with the specified price.  If the book op was DELETE or REMOVE, or the size was 0
@@ -513,6 +638,7 @@ public class PriceBook {
          * @param op the book op
          * @return true if the price resulted in a book update
          */
+        // TODO: add other ops here
         public boolean update(final long time,
                               final double price,
                               final int size,
@@ -589,6 +715,75 @@ public class PriceBook {
             sideChunk.close();
             opChunk.close();
             keyChunk.close();
+        }
+
+        /**
+         * Just a helper method to create fill contexts and save them so they can be cleaned up neatly on close.
+         *
+         * @param cs the column source
+         * @return a new fill context for that source.
+         */
+        ChunkSource.FillContext makeFillContext(ChunkSource<?> cs) {
+            final ChunkSource.FillContext fc = cs.makeFillContext(CHUNK_SIZE, sc);
+            fillContexts.add(fc);
+            return fc;
+        }
+    }
+
+    private static class InitContext implements SafeCloseable {
+        /*
+         * Each of these WriteableChunks are used to process the update data more efficiently in linear chunks
+         * instead of iterating over an index.  This avoids virtual method calls and is much more cache-friendly
+         */
+        final WritableObjectChunk<long[], ?> bidTimeChunk;
+        final WritableObjectChunk<long[], ?> askTimeChunk;
+        final WritableObjectChunk<int[], ?> bidSizeChunk;
+        final WritableObjectChunk<int[], ?> askSizeChunk;
+        final WritableObjectChunk<double[], ?> bidPriceChunk;
+        final WritableObjectChunk<double[], ?> askPriceChunk;
+        final List<WritableObjectChunk<?, ?>> groupingChunks;
+
+        /*
+         * The SharedContext and FillContexts are used by the column sources when they copy data into the chunks
+         * above in order to share resources within a single update cycle.
+         */
+        final SharedContext sc;
+        final List<ChunkSource.FillContext> fillContexts = new ArrayList<>(10);
+
+        InitContext(int depth, List<ColumnSource<?>> groupingSources) {
+            sc = SharedContext.makeSharedContext();
+            bidTimeChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            askTimeChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            bidSizeChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            askSizeChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            bidPriceChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            askPriceChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+
+            groupingChunks = new ArrayList<>();
+            for (int i = 0; i < groupingSources.size(); i++) {
+                groupingChunks.add(WritableObjectChunk.makeWritableChunk(CHUNK_SIZE));
+            }
+        }
+
+        /**
+         * At the end of an update cycle this must be invoked to close and release any shared resources that were claimed
+         * <p>
+         * during the update cycle.
+         */
+        @Override
+        public void close() {
+            sc.close();
+            fillContexts.forEach(ChunkSource.FillContext::close);
+            bidTimeChunk.close();
+            askTimeChunk.close();
+            bidSizeChunk.close();
+            askSizeChunk.close();
+            bidPriceChunk.close();
+            askPriceChunk.close();
+
+            for (final WritableChunk<?> chunk : groupingChunks) {
+                chunk.close();
+            }
         }
 
         /**
@@ -712,6 +907,7 @@ public class PriceBook {
                                    @NotNull String opColumnName,
                                    @NotNull String priceColumnName,
                                    @NotNull String... groupingCols) {
+        // TODO: Add nullable table input or diff constructor with a snapshot table
         final PriceBook book = new PriceBook(source,
                 depth,
                 batchTimestamps,

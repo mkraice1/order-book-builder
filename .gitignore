@@ -11,3 +11,5 @@ outTest/
 *.iml
 tmp/
 **/.DS_Store
+*.pyc
+*.pyo
