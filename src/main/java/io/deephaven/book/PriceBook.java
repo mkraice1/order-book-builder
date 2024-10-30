@@ -63,7 +63,15 @@ public class PriceBook {
     private static final int OP_INTERNAL_FILL = 4;
     private static final int OP_AWAY_FILL = 5;
 
-    private final Map<Object, BookState> states = new HashMap<>();
+    private static final String BID_PRC_NAME = "Bid_Price";
+    private static final String BID_TIME_NAME = "Bid_Timestamp";
+    private static final String BID_SIZE_NAME = "Bid_Size";
+
+    private static final String ASK_PRC_NAME = "Ask_Price";
+    private static final String ASK_TIME_NAME = "Ask_Timestamp";
+    private static final String ASK_SIZE_NAME = "Ask_Size";
+
+    private final Map<Object, BookState> states;
     private final boolean batchTimestamps;
     private final int depth;
 
@@ -98,6 +106,123 @@ public class PriceBook {
     private final boolean sourceIsBlink;
 
     // TODO: Add constructor that uses snapshot
+    private PriceBook(@NotNull final Table table,
+                      @NotNull final Table snapshot,
+                      final int depth,
+                      final boolean batchTimestamps,
+                      @NotNull String timestampColumnName,
+                      @NotNull String sizeColumnName,
+                      @NotNull String sideColumnName,
+                      @NotNull String opColumnName,
+                      @NotNull String priceColumnName,
+                      @NotNull String... groupingCols) {
+        final QueryTable source = (QueryTable) table.coalesce();
+        this.batchTimestamps = batchTimestamps;
+        this.depth = depth;
+        this.sourceIsBlink = BlinkTableTools.isBlink(source);
+
+        // Init states using book snapshot
+        this.states = processInitBook(snapshot, groupingCols);
+
+
+        // Begin by getting references to the column sources from the input table to process later.
+        this.timeSource = ReinterpretUtils.instantToLongSource(source.getColumnSource(timestampColumnName));
+        this.priceSource = source.getColumnSource(priceColumnName);
+        this.sizeSource = source.getColumnSource(sizeColumnName);
+        this.sideSource = source.getColumnSource(sideColumnName);
+        this.opSource = source.getColumnSource(opColumnName);
+
+        // Since we may group by more than one column (say Symbol, Exchange) we want to create a single key object to look into
+        // the book state map.  Packing the key sources into a tuple does this neatly.
+        this.keySource = TupleSourceFactory.makeTupleSource(Arrays.stream(groupingCols).map(source::getColumnSource).toArray(ColumnSource[]::new));
+
+        // Construct the new column sources and result table.
+        final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
+
+        // Now we get the columns from snapshot which will be in the output table
+        timeResult = snapshot.getColumnSource("Timestamp");
+        columnSourceMap.put("Timestamp", timeResult);
+
+        // Change to getting grouping col source from snapshot
+        keyOutputSources = new WritableColumnSource[groupingCols.length];
+        for(int ii = 0; ii < groupingCols.length; ii++) {
+            final String groupingColName = groupingCols[ii];
+            final ColumnSource<?> gsCol = snapshot.getColumnSource(groupingColName);
+            keyOutputSources[ii] = ArrayBackedColumnSource.getMemoryColumnSource(gsCol.getType(), gsCol.getComponentType());
+            columnSourceMap.put(groupingColName, keyOutputSources[ii]);
+        }
+
+        // Initialize cols using the snapshot instead of empty
+        bidPriceResults = snapshot.getColumnSource(BID_PRC_NAME);
+        bidTimeResults = snapshot.getColumnSource(BID_TIME_NAME);
+        bidSizeResults = snapshot.getColumnSource(BID_SIZE_NAME);
+        columnSourceMap.put(BID_PRC_NAME, bidPriceResults);
+        columnSourceMap.put(BID_TIME_NAME, bidTimeResults);
+        columnSourceMap.put(BID_SIZE_NAME, bidSizeResults);
+
+        askPriceResults = snapshot.getColumnSource(ASK_PRC_NAME);
+        askTimeResults = snapshot.getColumnSource(ASK_TIME_NAME);
+        askSizeResults = snapshot.getColumnSource(ASK_SIZE_NAME);
+        columnSourceMap.put(ASK_PRC_NAME, askPriceResults);
+        columnSourceMap.put(ASK_TIME_NAME, askTimeResults);
+        columnSourceMap.put(ASK_SIZE_NAME, askSizeResults);
+
+        // Set result table
+        final OperationSnapshotControl snapshotControl =
+                source.createSnapshotControlIfRefreshing(OperationSnapshotControl::new);
+
+        final MutableObject<QueryTable> result = new MutableObject<>();
+        final MutableObject<BookListener> listenerHolder = new MutableObject<>();
+
+        // result table will be the snapshot + any new data from the source
+        QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
+                (prevRequested, beforeClock) -> {
+                    final boolean usePrev = prevRequested && source.isRefreshing();
+
+                    // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
+                    // the LTM thread and so it must know if it should use previous values or current values.
+                    final long rowsAdded = processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev);
+
+                    // init from snapshot. columnSourceMap has all the data from the book snapshot
+                    final QueryTable bookTable = new QueryTable(
+                            (rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1)).toTracking()
+                            , columnSourceMap);
+
+                    if (snapshotControl != null) {
+                        columnSourceMap.values().forEach(ColumnSource::startTrackingPrevValues);
+                        bookTable.setRefreshing(true);
+                        bookTable.setAttribute(Table.BLINK_TABLE_ATTRIBUTE, true);
+                        bookTable.getRowSet().writableCast().initializePreviousValue();
+
+                        // To Produce a blink table we need to be able to respond to upstream changes when they exist
+                        // and we also need to be able to produce downstream updates, even if upstream did NOT change.
+                        // This is what the ListenerRecorder and MergedListener (BookListener) are for.  The
+                        // ListenerRecorder will simply record any TableUpdate produced by the source and notify the
+                        // MergedListener (BookListener) that something happened.
+                        // The BookListener will wait for both the UpdateGraphProcessor AND the ListenerRecorder to
+                        // be satisfied before it does process().  This way, we properly handle upstream ticks, and
+                        // also properly blink out rows when there are no updates.
+                        final ListenerRecorder recorder = new ListenerRecorder("BookBuilderListenerRecorder", source, null);
+                        final BookListener bl = new BookListener(recorder, source, bookTable);
+                        recorder.setMergedListener(bl);
+                        bookTable.addParentReference(bl);
+                        snapshotControl.setListenerAndResult(recorder, bookTable);
+                        listenerHolder.set(bl);
+                    }
+                    result.set(bookTable);
+                    return true;
+                });
+        
+        // TODO: Do I just set the snapshot to the result table?
+        this.resultTable = result.get();
+        this.resultIndex = resultTable.getRowSet().writableCast();
+        if(source.isRefreshing()) {
+            this.bookListener = listenerHolder.get();
+            bookListener.getUpdateGraph().addSource(bookListener);
+        } else {
+            bookListener = null;
+        }
+    }
 
     private PriceBook(@NotNull final Table table,
                       final int depth,
@@ -113,6 +238,7 @@ public class PriceBook {
         this.depth = depth;
         this.sourceIsBlink = BlinkTableTools.isBlink(source);
 
+        this.states = new HashMap<>();
 
         ////vv Change to do this from a snapshot from book ??  vv////
 
@@ -151,16 +277,16 @@ public class PriceBook {
         bidPriceResults = new ObjectArraySource<>(double[].class);
         bidTimeResults = new ObjectArraySource<>(long[].class);
         bidSizeResults = new ObjectArraySource<>(int[].class);
-        columnSourceMap.put("Bid_Price", bidPriceResults);
-        columnSourceMap.put("Bid_Timestamp", bidTimeResults);
-        columnSourceMap.put("Bid_Size", bidSizeResults);
+        columnSourceMap.put(BID_PRC_NAME, bidPriceResults);
+        columnSourceMap.put(BID_TIME_NAME, bidTimeResults);
+        columnSourceMap.put(BID_SIZE_NAME, bidSizeResults);
 
         askPriceResults = new ObjectArraySource<>(double[].class);
         askTimeResults = new ObjectArraySource<>(long[].class);
         askSizeResults = new ObjectArraySource<>(int[].class);
-        columnSourceMap.put("Ask_Price", askPriceResults);
-        columnSourceMap.put("Ask_Timestamp", askTimeResults);
-        columnSourceMap.put("Ask_Size", askSizeResults);
+        columnSourceMap.put(ASK_PRC_NAME, askPriceResults);
+        columnSourceMap.put(ASK_TIME_NAME, askTimeResults);
+        columnSourceMap.put(ASK_SIZE_NAME, askSizeResults);
 
         // Finally, create the result table for the user
         final OperationSnapshotControl snapshotControl =
@@ -207,6 +333,7 @@ public class PriceBook {
                     result.set(bookTable);
                     return true;
                 });
+
         // TODO: Do I just set the snapshot to the result table?
         this.resultTable = result.get();
         this.resultIndex = resultTable.getRowSet().writableCast();
@@ -327,12 +454,13 @@ public class PriceBook {
     final Map<Object, BookState> processInitBook(final Table t, String... groupings) {
         final Map<Object, BookState> initStates = new HashMap<>();
 
-        final ColumnSource<long[]> bidTSSource = t.getColumnSource("bid_times");
-        final ColumnSource<long[]> askTSSource = t.getColumnSource("ask_times");
-        final ColumnSource<int[]> bidSizesSource = t.getColumnSource("bid_sizes");
-        final ColumnSource<int[]> askSizesSource = t.getColumnSource("ask_sizes");
-        final ColumnSource<double[]> bidsSource = t.getColumnSource("bids");
-        final ColumnSource<double[]> asksSource = t.getColumnSource("asks");
+        final ColumnSource<long[]> bidTSSource = t.getColumnSource(BID_PRC_NAME);
+        final ColumnSource<long[]> askTSSource = t.getColumnSource(BID_TIME_NAME);
+        final ColumnSource<int[]> bidSizesSource = t.getColumnSource(BID_SIZE_NAME);
+        final ColumnSource<int[]> askSizesSource = t.getColumnSource(ASK_PRC_NAME);
+        final ColumnSource<double[]> bidsSource = t.getColumnSource(ASK_TIME_NAME);
+        final ColumnSource<double[]> asksSource = t.getColumnSource(ASK_SIZE_NAME);
+
 
         final List<ColumnSource<?>> groupingSources = new ArrayList<>();
         for (final String grouping : groupings) {
