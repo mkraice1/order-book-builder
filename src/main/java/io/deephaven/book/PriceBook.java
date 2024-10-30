@@ -17,6 +17,7 @@ import org.jetbrains.annotations.NotNull;
 import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
 
 import io.deephaven.tuple.ArrayTuple;
+import java.time.Instant;
 
 import java.util.*;
 
@@ -140,7 +141,8 @@ public class PriceBook {
         final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
 
         // Now we get the columns from snapshot which will be in the output table
-        timeResult = snapshot.getColumnSource("Timestamp");
+        // ColumnSource<Instant> test = (ColumnSource<Instant>) snapshot.getColumnSource("Timestamp", Instant.class);
+        timeResult = (InstantArraySource) snapshot.getColumnSource("Timestamp", Instant.class);
         columnSourceMap.put("Timestamp", timeResult);
 
         // Change to getting grouping col source from snapshot
@@ -153,16 +155,16 @@ public class PriceBook {
         }
 
         // Initialize cols using the snapshot instead of empty
-        bidPriceResults = snapshot.getColumnSource(BID_PRC_NAME);
-        bidTimeResults = snapshot.getColumnSource(BID_TIME_NAME);
-        bidSizeResults = snapshot.getColumnSource(BID_SIZE_NAME);
+        bidPriceResults = (ObjectArraySource<double[]>) snapshot.getColumnSource(BID_PRC_NAME, double[].class);
+        bidTimeResults = (ObjectArraySource<long[]>) snapshot.getColumnSource(BID_TIME_NAME, long[].class);
+        bidSizeResults = (ObjectArraySource<int[]>) snapshot.getColumnSource(BID_SIZE_NAME, int[].class);
         columnSourceMap.put(BID_PRC_NAME, bidPriceResults);
         columnSourceMap.put(BID_TIME_NAME, bidTimeResults);
         columnSourceMap.put(BID_SIZE_NAME, bidSizeResults);
 
-        askPriceResults = snapshot.getColumnSource(ASK_PRC_NAME);
-        askTimeResults = snapshot.getColumnSource(ASK_TIME_NAME);
-        askSizeResults = snapshot.getColumnSource(ASK_SIZE_NAME);
+        askPriceResults = (ObjectArraySource<double[]>) snapshot.getColumnSource(ASK_PRC_NAME,  double[].class);
+        askTimeResults = (ObjectArraySource<long[]>) snapshot.getColumnSource(ASK_TIME_NAME,  long[].class);
+        askSizeResults = (ObjectArraySource<int[]>) snapshot.getColumnSource(ASK_SIZE_NAME,  int[].class);
         columnSourceMap.put(ASK_PRC_NAME, askPriceResults);
         columnSourceMap.put(ASK_TIME_NAME, askTimeResults);
         columnSourceMap.put(ASK_SIZE_NAME, askSizeResults);
@@ -183,10 +185,13 @@ public class PriceBook {
                     // the LTM thread and so it must know if it should use previous values or current values.
                     final long rowsAdded = processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev);
 
-                    // init from snapshot. columnSourceMap has all the data from the book snapshot
+                    // init from snapshot. columnSourceMap has all the data from the book snapshot.
                     final QueryTable bookTable = new QueryTable(
                             (rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1)).toTracking()
                             , columnSourceMap);
+
+                    // final QueryTable bookTable = snapshot;
+                    System.out.println(bookTable.size());
 
                     if (snapshotControl != null) {
                         columnSourceMap.values().forEach(ColumnSource::startTrackingPrevValues);
@@ -454,12 +459,12 @@ public class PriceBook {
     final Map<Object, BookState> processInitBook(final Table t, String... groupings) {
         final Map<Object, BookState> initStates = new HashMap<>();
 
-        final ColumnSource<long[]> bidTSSource = t.getColumnSource(BID_PRC_NAME);
-        final ColumnSource<long[]> askTSSource = t.getColumnSource(BID_TIME_NAME);
+        final ColumnSource<long[]> bidTSSource = t.getColumnSource(BID_TIME_NAME);
+        final ColumnSource<long[]> askTSSource = t.getColumnSource(ASK_TIME_NAME);
         final ColumnSource<int[]> bidSizesSource = t.getColumnSource(BID_SIZE_NAME);
-        final ColumnSource<int[]> askSizesSource = t.getColumnSource(ASK_PRC_NAME);
-        final ColumnSource<double[]> bidsSource = t.getColumnSource(ASK_TIME_NAME);
-        final ColumnSource<double[]> asksSource = t.getColumnSource(ASK_SIZE_NAME);
+        final ColumnSource<int[]> askSizesSource = t.getColumnSource(ASK_SIZE_NAME);
+        final ColumnSource<double[]> bidsSource = t.getColumnSource(BID_PRC_NAME);
+        final ColumnSource<double[]> asksSource = t.getColumnSource(ASK_PRC_NAME);
 
 
         final List<ColumnSource<?>> groupingSources = new ArrayList<>();
@@ -1032,6 +1037,49 @@ public class PriceBook {
                                    @NotNull String... groupingCols) {
         // TODO: Add nullable table input or diff constructor with a snapshot table
         final PriceBook book = new PriceBook(source,
+                depth,
+                batchTimestamps,
+                timestampColumnName,
+                sizeColumnName,
+                sideColumnName,
+                opColumnName,
+                priceColumnName,
+                groupingCols);
+
+        return book.resultTable;
+    }
+
+    /**
+     * Build a book of bid and ask prices with the specified number of levels from the requested table, grouping input rows by the
+     * specified set of grouping columns.  Levels will be represented as a set of columns (Price, Time, Size) for each level.
+     *
+     * @param source the table with the source data
+     * @param snapshot the table with the book
+     * @param depth the desired book depth
+     * @param batchTimestamps set to true to batch input rows with identical timestamps into the a single output row.
+     * @param timestampColumnName the name of the source timestamp column
+     * @param sizeColumnName the name of the source size column
+     * @param sideColumnName the name of the source side column
+     * @param opColumnName the name of the source book-op column
+     * @param priceColumnName the name of the price column
+     * @param groupingCols the columns to group the source table by
+     *
+     * @return a new table representing the current state of the book.  This table will update as the source table updates.
+     */
+    @SuppressWarnings("unused")
+    public static QueryTable build(@NotNull Table source,
+                                   @NotNull Table snapshot,
+                                   int depth,
+                                   boolean batchTimestamps,
+                                   @NotNull String timestampColumnName,
+                                   @NotNull String sizeColumnName,
+                                   @NotNull String sideColumnName,
+                                   @NotNull String opColumnName,
+                                   @NotNull String priceColumnName,
+                                   @NotNull String... groupingCols) {
+        // TODO: Add nullable table input or diff constructor with a snapshot table
+        final PriceBook book = new PriceBook(source,
+                snapshot,
                 depth,
                 batchTimestamps,
                 timestampColumnName,
