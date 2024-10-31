@@ -18,6 +18,7 @@ import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
 
 import io.deephaven.tuple.ArrayTuple;
 import java.time.Instant;
+import java.util.stream.Collectors;
 
 import java.util.*;
 
@@ -72,7 +73,7 @@ public class PriceBook {
     private static final String ASK_TIME_NAME = "Ask_Timestamp";
     private static final String ASK_SIZE_NAME = "Ask_Size";
 
-    private final Map<Object, BookState> states;
+    private Map<Object, BookState> states;
     private final boolean batchTimestamps;
     private final int depth;
 
@@ -122,8 +123,7 @@ public class PriceBook {
         this.depth = depth;
         this.sourceIsBlink = BlinkTableTools.isBlink(source);
 
-        // Init states using book snapshot
-        this.states = processInitBook(snapshot, groupingCols);
+        this.states = null;
 
 
         // Begin by getting references to the column sources from the input table to process later.
@@ -140,31 +140,31 @@ public class PriceBook {
         // Construct the new column sources and result table.
         final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
 
-        // Now we get the columns from snapshot which will be in the output table
-        // ColumnSource<Instant> test = (ColumnSource<Instant>) snapshot.getColumnSource("Timestamp", Instant.class);
-        timeResult = (InstantArraySource) snapshot.getColumnSource("Timestamp", Instant.class);
+        // Now we create the columns which will be in the output table
+        timeResult = new InstantArraySource();
         columnSourceMap.put("Timestamp", timeResult);
 
-        // Change to getting grouping col source from snapshot
+        // Shouldn't need to do ths?
         keyOutputSources = new WritableColumnSource[groupingCols.length];
         for(int ii = 0; ii < groupingCols.length; ii++) {
             final String groupingColName = groupingCols[ii];
-            final ColumnSource<?> gsCol = snapshot.getColumnSource(groupingColName);
+            final ColumnSource<?> gsCol = source.getColumnSource(groupingColName);
             keyOutputSources[ii] = ArrayBackedColumnSource.getMemoryColumnSource(gsCol.getType(), gsCol.getComponentType());
             columnSourceMap.put(groupingColName, keyOutputSources[ii]);
         }
 
-        // Initialize cols using the snapshot instead of empty
-        bidPriceResults = (ObjectArraySource<double[]>) snapshot.getColumnSource(BID_PRC_NAME, double[].class);
-        bidTimeResults = (ObjectArraySource<long[]>) snapshot.getColumnSource(BID_TIME_NAME, long[].class);
-        bidSizeResults = (ObjectArraySource<int[]>) snapshot.getColumnSource(BID_SIZE_NAME, int[].class);
+        // The number of Price/Timestamp/Size columns is twice the requested book depth,  one set for
+        // bids, and one set for asks.
+        bidPriceResults = new ObjectArraySource<>(double[].class);
+        bidTimeResults = new ObjectArraySource<>(long[].class);
+        bidSizeResults = new ObjectArraySource<>(int[].class);
         columnSourceMap.put(BID_PRC_NAME, bidPriceResults);
         columnSourceMap.put(BID_TIME_NAME, bidTimeResults);
         columnSourceMap.put(BID_SIZE_NAME, bidSizeResults);
 
-        askPriceResults = (ObjectArraySource<double[]>) snapshot.getColumnSource(ASK_PRC_NAME,  double[].class);
-        askTimeResults = (ObjectArraySource<long[]>) snapshot.getColumnSource(ASK_TIME_NAME,  long[].class);
-        askSizeResults = (ObjectArraySource<int[]>) snapshot.getColumnSource(ASK_SIZE_NAME,  int[].class);
+        askPriceResults = new ObjectArraySource<>(double[].class);
+        askTimeResults = new ObjectArraySource<>(long[].class);
+        askSizeResults = new ObjectArraySource<>(int[].class);
         columnSourceMap.put(ASK_PRC_NAME, askPriceResults);
         columnSourceMap.put(ASK_TIME_NAME, askTimeResults);
         columnSourceMap.put(ASK_SIZE_NAME, askSizeResults);
@@ -176,22 +176,37 @@ public class PriceBook {
         final MutableObject<QueryTable> result = new MutableObject<>();
         final MutableObject<BookListener> listenerHolder = new MutableObject<>();
 
+
+        // Process state here and just make a copy in the initializeWithSnapshot context, 
+        // so we dont keep re-processing things if that init fails
+        final Map<Object, BookState> tempStates = processInitBook(snapshot, groupingCols);
+
+        // If we want the output table to start with the old book, we need to record the changes...
+        // iter state map and call append/record recordChange for each key, record num rows
+        // rowsAdded = record num rows + rowsAdded
+
         // result table will be the snapshot + any new data from the source
         QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
                 (prevRequested, beforeClock) -> {
+
+                    // Deep copy states
+                    this.states = tempStates.entrySet()
+                                .stream()
+                                .collect(Collectors.toMap(
+                                    Map.Entry::getKey,
+                                    entry -> entry.getValue().deepCopy()));
+
                     final boolean usePrev = prevRequested && source.isRefreshing();
 
                     // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
                     // the LTM thread and so it must know if it should use previous values or current values.
-                    final long rowsAdded = processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev);
+                    final long rowsAdded = processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev); // 
 
-                    // init from snapshot. columnSourceMap has all the data from the book snapshot.
+                    //nit from snapshot. columnSourceMap has all the data from the book snapshot.
                     final QueryTable bookTable = new QueryTable(
                             (rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1)).toTracking()
                             , columnSourceMap);
 
-                    // final QueryTable bookTable = snapshot;
-                    System.out.println(bookTable.size());
 
                     if (snapshotControl != null) {
                         columnSourceMap.values().forEach(ColumnSource::startTrackingPrevValues);
@@ -217,8 +232,8 @@ public class PriceBook {
                     result.set(bookTable);
                     return true;
                 });
-        
-        // TODO: Do I just set the snapshot to the result table?
+        // tempStates = null;
+
         this.resultTable = result.get();
         this.resultIndex = resultTable.getRowSet().writableCast();
         if(source.isRefreshing()) {
@@ -618,7 +633,7 @@ public class PriceBook {
         private final Double2IntOpenHashMap sizeMap;
         private final Double2LongOpenHashMap timestampMap;
 
-        private final long depth;
+        private final int depth;
         private final Comparator<Double> comparator;
 
         Book(int depth, 
@@ -654,6 +669,42 @@ public class PriceBook {
             this.timestampMap.defaultReturnValue(-1);
             bestPrices = MinMaxPriorityQueue.orderedBy(comparator).maximumSize(depth).create();
             overflowPrices = new PriorityQueue<>(comparator);
+        }
+
+
+        // Copy constructor
+        Book(int depth, 
+                Comparator<Double> comparator, 
+                Double2IntOpenHashMap sizeMap, 
+                Double2LongOpenHashMap timestampMap, 
+                MinMaxPriorityQueue<Double> bestPrices, 
+                PriorityQueue overflowPrices) {
+
+            this.depth = depth;
+            this.comparator = comparator;
+            this.sizeMap = sizeMap;
+            this.timestampMap = timestampMap;
+            this.sizeMap.defaultReturnValue(-1);
+            this.timestampMap.defaultReturnValue(-1);
+            this.bestPrices = bestPrices;
+            this.overflowPrices = overflowPrices;
+        }
+
+        // make a deep copy of the Book
+        private Book deepCopy() {
+
+            MinMaxPriorityQueue<Double> bestPricesCopy = MinMaxPriorityQueue.create();
+            for (Double element : this.bestPrices) {
+                bestPricesCopy.add(element.doubleValue()); 
+            }
+
+            PriorityQueue<Double> overflowPricesCopy = new PriorityQueue<Double>(overflowPrices);
+
+            return new Book(this.depth, this.comparator, 
+                (Double2IntOpenHashMap) this.sizeMap.clone(), 
+                (Double2LongOpenHashMap) this.timestampMap.clone(), 
+                (MinMaxPriorityQueue<Double>) bestPricesCopy, 
+                (PriorityQueue<Double>) overflowPricesCopy);
         }
 
 
@@ -739,12 +790,12 @@ public class PriceBook {
         final Book asks;
 
         BookState(int depth,
-                long[] bidTimeArr,
-                long[] askTimeArr,
-                int[] bidSizeArr,
-                int[] askSizeArr,
-                double[] bidPriceArr,
-                double[] askPriceArr ) {
+                  long[] bidTimeArr,
+                  long[] askTimeArr,
+                  int[] bidSizeArr,
+                  int[] askSizeArr,
+                  double[] bidPriceArr,
+                  double[] askPriceArr ) {
 
             bids = new Book(depth, Comparator.reverseOrder(), bidTimeArr, bidSizeArr, bidPriceArr);
             asks = new Book(depth, Comparator.naturalOrder(), askTimeArr, askSizeArr, askPriceArr);
@@ -754,6 +805,15 @@ public class PriceBook {
         BookState(int depth) {
             bids = new Book(depth, Comparator.reverseOrder());
             asks = new Book(depth, Comparator.naturalOrder());
+        }
+
+        BookState(Book bidsBook, Book asksBook) {
+            bids = bidsBook;
+            asks = asksBook;
+        }
+
+        private BookState deepCopy() {
+            return new BookState(this.bids.deepCopy(), this.asks.deepCopy());
         }
 
         /**
