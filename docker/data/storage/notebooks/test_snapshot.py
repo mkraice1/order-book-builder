@@ -1,4 +1,3 @@
-
 from deephaven.parquet import read
 from deephaven import TableReplayer, merge, read_csv
 import bookbuilder
@@ -14,33 +13,35 @@ EVT_map = {"Order Ack": 1, "Cancel Replace Ack" : 2, "Cancel Order": 3, "Interna
 
 order_sample = read_csv("/data/order_sample.csv").view(["EVT_TYP", "SYMB", "EPOCH_TS", "ORD_ID=CLIENT_ORD_ID", "ORD_QTY=QTY", "EXEC_QTY=(int) null", "CXL_QTY=(int) null", "PRC", "SIDE"])
 
-#  Try with just orders...
+#  Try with just orders... make everything a 1
 order_sample = order_sample.update_view(["EPOCH_TS = Instant.ofEpochSecond((long) (EPOCH_TS/SECOND), EPOCH_TS % SECOND)", 
         "EVT_ID = 1"])
 
-orderrp = TableReplayer("2024-10-10T02:29:55 ET", "2024-10-25T02:40:00 ET")
-order_ticking_data = orderrp.add_table(order_sample, "EPOCH_TS")
-orderrp.start()
-
 # Get some old book
-static_data_ = read("/data/Quotes.parquet")
-rp_ = TableReplayer("2017-08-26T09:30:00 ET", "2017-08-26T23:59:59 ET")
-ticking_data_ = rp_.add_table(static_data_, "Timestamp")
-rp_.start()
-old_book = bookbuilder.build_book(ticking_data_).rename_columns("SYMB=Sym").last_by("SYMB")
+old_data = order_sample.where("EPOCH_TS < '2024-10-10T02:30:01.007 ET'")
+
+old_book = bookbuilder.build_book(old_data,\
+            book_depth = 3,\
+            timestamp_col = "EPOCH_TS",\
+            size_col = "ORD_QTY",\
+            side_col = "SIDE",\
+            op_col = "EVT_ID",\
+            price_col = "PRC",\
+            group_cols = ["SYMB"])
 old_book = old_book.snapshot()
 
 
+new_data = order_sample.where("EPOCH_TS >= '2024-10-10T02:30:01.007 ET'")
+
 # Make new book starting with old one
-book = bookbuilder.build_book_with_snap(source=order_ticking_data,\
+book = bookbuilder.build_book_with_snap(source=new_data,\
             snapshot = old_book,\
-            book_depth = 2,\
+            book_depth = 3,\
             timestamp_col = "EPOCH_TS",\
             size_col = "ORD_QTY",\
             side_col = "SIDE",\
             op_col = "EVT_ID",\
             price_col = "PRC",\
             group_cols = ["SYMB"]).last_by("SYMB")
-
 
 

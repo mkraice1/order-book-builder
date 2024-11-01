@@ -123,6 +123,7 @@ public class PriceBook {
         this.depth = depth;
         this.sourceIsBlink = BlinkTableTools.isBlink(source);
 
+        // Need to set states
         this.states = null;
 
 
@@ -181,13 +182,30 @@ public class PriceBook {
         // so we dont keep re-processing things if that init fails
         final Map<Object, BookState> tempStates = processInitBook(snapshot, groupingCols);
 
+
         // If we want the output table to start with the old book, we need to record the changes...
-        // iter state map and call append/record recordChange for each key, record num rows
+        // iter state map and call recordChange for each key, record num rows
         // rowsAdded = record num rows + rowsAdded
+        final Context ctx = new Context(depth);
+
+        // Whats the right key?
+        Instant timeNow = Instant.now();
+        long timeNowNanos = timeNow.getEpochSecond() * 1000000000 + timeNow.getNano();
+        for (var entry : tempStates.entrySet()) {
+            // This seems to work on init, but any new update to the same key will replace the row in the book.
+            // recordChange(ctx, entry.getValue(), timeNowNanos, ((ArrayTuple) entry.getKey()).getElement(0));
+
+            // This gets an ArrayTuple error
+            recordChange(ctx, entry.getValue(), timeNowNanos, ((ArrayTuple) entry.getKey()));
+        }
+
+        final long lastRow = ctx.rowsAdded;
+        System.out.println(lastRow);
 
         // result table will be the snapshot + any new data from the source
         QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
                 (prevRequested, beforeClock) -> {
+                    System.out.println("In snapshot control");
 
                     // Deep copy states
                     this.states = tempStates.entrySet()
@@ -200,15 +218,16 @@ public class PriceBook {
 
                     // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
                     // the LTM thread and so it must know if it should use previous values or current values.
-                    final long rowsAdded = processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev); // 
+                    final long rowsAdded = lastRow + processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev); // 
 
-                    //nit from snapshot. columnSourceMap has all the data from the book snapshot.
+                    //nit from snapshot. columnSourceMap has all the data from the book snapshot. lastRow?
                     final QueryTable bookTable = new QueryTable(
                             (rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1)).toTracking()
                             , columnSourceMap);
 
 
                     if (snapshotControl != null) {
+                        System.out.println("Snap is not null");
                         columnSourceMap.values().forEach(ColumnSource::startTrackingPrevValues);
                         bookTable.setRefreshing(true);
                         bookTable.setAttribute(Table.BLINK_TABLE_ATTRIBUTE, true);
@@ -230,6 +249,7 @@ public class PriceBook {
                         listenerHolder.set(bl);
                     }
                     result.set(bookTable);
+                    System.out.println("Set book table");
                     return true;
                 });
         // tempStates = null;
@@ -242,6 +262,7 @@ public class PriceBook {
         } else {
             bookListener = null;
         }
+        System.out.println("Done init");
     }
 
     private PriceBook(@NotNull final Table table,
@@ -260,8 +281,6 @@ public class PriceBook {
 
         this.states = new HashMap<>();
 
-        ////vv Change to do this from a snapshot from book ??  vv////
-
         // Begin by getting references to the column sources from the input table to process later.
         this.timeSource = ReinterpretUtils.instantToLongSource(source.getColumnSource(timestampColumnName));
         this.priceSource = source.getColumnSource(priceColumnName);
@@ -275,8 +294,6 @@ public class PriceBook {
 
         // Construct the new column sources and result table.
         final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
-
-        ////^^ Change to do this from a snapshot from book ??  ^^////
 
 
         // Now we create the columns which will be in the output table
@@ -315,7 +332,7 @@ public class PriceBook {
         final MutableObject<QueryTable> result = new MutableObject<>();
         final MutableObject<BookListener> listenerHolder = new MutableObject<>();
 
-        // TODO: am I replacing this? or do I build from snapshot, and then do this?
+
         QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
                 (prevRequested, beforeClock) -> {
                     final boolean usePrev = prevRequested && source.isRefreshing();
