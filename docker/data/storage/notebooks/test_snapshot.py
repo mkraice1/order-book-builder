@@ -17,8 +17,10 @@ order_sample = read_csv("/data/order_sample.csv").view(["EVT_TYP", "SYMB", "EPOC
 order_sample = order_sample.update_view(["EPOCH_TS = Instant.ofEpochSecond((long) (EPOCH_TS/SECOND), EPOCH_TS % SECOND)", 
         "EVT_ID = 1"])
 
+
 # Get some old book
 old_data = order_sample.where("EPOCH_TS < '2024-10-10T02:30:01.007 ET'")
+# .update_view("SYMB = `AMZN`")
 
 old_book = bookbuilder.build_book(old_data,\
             book_depth = 3,\
@@ -27,14 +29,18 @@ old_book = bookbuilder.build_book(old_data,\
             side_col = "SIDE",\
             op_col = "EVT_ID",\
             price_col = "PRC",\
-            group_cols = ["SYMB"])
-old_book = old_book.snapshot()
+            group_cols = ["SYMB"]).last_by("SYMB")
+# old_book = old_book.snapshot()
 
 
 new_data = order_sample.where("EPOCH_TS >= '2024-10-10T02:30:01.007 ET'")
 
+rp = TableReplayer("2024-10-10T02:29:55 ET", "2024-10-25T02:40:00 ET")
+ticking_data = rp.add_table(new_data, "EPOCH_TS")
+rp.start()
+
 # Make new book starting with old one
-book = bookbuilder.build_book_with_snap(source=new_data,\
+book = bookbuilder.build_book_with_snap(source=ticking_data,\
             snapshot = old_book,\
             book_depth = 3,\
             timestamp_col = "EPOCH_TS",\
