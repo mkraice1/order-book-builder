@@ -28,7 +28,8 @@ dependencies {
     implementation platform("io.deephaven:deephaven-bom:${dhcVersion}"),
                    "io.deephaven:deephaven-engine-table",
                    "it.unimi.dsi:fastutil:8.5.13",
-                   "io.deephaven:deephaven-engine-tuple"
+                   "io.deephaven:deephaven-engine-tuple",
+                   "io.deephaven:deephaven-engine-tuplesource"
     runtimeOnly "io.deephaven:deephaven-log-to-slf4j",
                 'ch.qos.logback:logback-classic:1.4.5'
 }

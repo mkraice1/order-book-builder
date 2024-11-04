@@ -19,7 +19,8 @@ import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
 import io.deephaven.tuple.ArrayTuple;
 import java.time.Instant;
 import java.util.stream.Collectors;
-
+import io.deephaven.engine.table.impl.tuplesource.TupleSourceCreatorImpl.TupleSourceCreatorProvider;
+import io.deephaven.engine.table.impl.tuplesource.TupleSourceCreatorImpl;
 import java.util.*;
 
 /**
@@ -145,7 +146,7 @@ public class PriceBook {
         timeResult = new InstantArraySource();
         columnSourceMap.put("Timestamp", timeResult);
 
-        // Shouldn't need to do ths?
+
         keyOutputSources = new WritableColumnSource[groupingCols.length];
         for(int ii = 0; ii < groupingCols.length; ii++) {
             final String groupingColName = groupingCols[ii];
@@ -181,22 +182,21 @@ public class PriceBook {
         // Process state here and just make a copy in the initializeWithSnapshot context, 
         // so we dont keep re-processing things if that init fails
         final Map<Object, BookState> tempStates = processInitBook(snapshot, groupingCols);
-
-
-        // If we want the output table to start with the old book, we need to record the changes...
-        // iter state map and call recordChange for each key, record num rows
-        // rowsAdded = record num rows + rowsAdded
+        final TupleSource snapKeySource = TupleSourceFactory.makeTupleSource(Arrays.stream(groupingCols).map(snapshot::getColumnSource).toArray(ColumnSource[]::new));
         final Context ctx = new Context(depth);
 
-        // Whats the right key?
+
+        System.out.println(tempStates);
+        System.out.println(snapKeySource.tupleLength());
+        
+        int sizeOfTupleSource = snapKeySource.tupleLength(); //This is just 1, wont work
         Instant timeNow = Instant.now();
         long timeNowNanos = timeNow.getEpochSecond() * 1000000000 + timeNow.getNano();
-        for (var entry : tempStates.entrySet()) {
-            // This seems to work on init, but any new update to the same key will replace the row in the book.
-            // recordChange(ctx, entry.getValue(), timeNowNanos, ((ArrayTuple) entry.getKey()).getElement(0));
+        for (int i=0; i < sizeOfTupleSource; i++) {
 
-            // This gets an ArrayTuple error
-            recordChange(ctx, entry.getValue(), timeNowNanos, ((ArrayTuple) entry.getKey()));
+            Object key = snapKeySource.createTuple(i);
+            BookState entry = tempStates.get(key);
+            recordChange(ctx, entry, timeNowNanos, key);
         }
 
         final long lastRow = ctx.rowsAdded;
@@ -380,6 +380,7 @@ public class PriceBook {
         } else {
             bookListener = null;
         }
+        System.out.println(this.states);
     }
 
     /**
@@ -505,6 +506,8 @@ public class PriceBook {
             groupingSources.add(colSource);
         }
 
+        TupleSource snapKeySource = TupleSourceFactory.makeTupleSource(Arrays.stream(groupings).map(t::getColumnSource).toArray(ColumnSource[]::new));
+
         try(final InitContext context = new InitContext(depth, groupingSources)) {
             // Next we get an iterator into the added index so that we can process the update in chunks.
             final RowSequence.Iterator okit = t.getRowSet().getRowSequenceIterator();
@@ -539,8 +542,7 @@ public class PriceBook {
 
                 for (int ii = 0; ii < nextKeys.size(); ii++) {
                     final int finalII = ii;
-                    final ArrayTuple key = new ArrayTuple(context.groupingChunks.stream()
-                            .map(c -> c.get(finalII)).toArray(Object[]::new));
+                    final Object key = snapKeySource.createTuple(finalII);
 
                     initStates.put(key, new BookState(depth,
                             context.bidTimeChunk.get(ii),
