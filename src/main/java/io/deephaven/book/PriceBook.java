@@ -16,11 +16,8 @@ import it.unimi.dsi.fastutil.doubles.Double2LongOpenHashMap;
 import org.jetbrains.annotations.NotNull;
 import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
 
-import io.deephaven.tuple.ArrayTuple;
 import java.time.Instant;
 import java.util.stream.Collectors;
-import io.deephaven.engine.table.impl.tuplesource.TupleSourceCreatorImpl.TupleSourceCreatorProvider;
-import io.deephaven.engine.table.impl.tuplesource.TupleSourceCreatorImpl;
 import java.util.*;
 
 /**
@@ -60,6 +57,7 @@ public class PriceBook {
     private static final int SIDE_BUY = 1;
     private static final int SIDE_SELL = 2;
 
+    // These will need to be properly implemented
     private static final int OP_INSERT = 1;
     private static final int OP_REMOVE = 2;
     private static final int OP_CANCEL = 3;
@@ -108,7 +106,6 @@ public class PriceBook {
 
     private final boolean sourceIsBlink;
 
-    // TODO: Add constructor that uses snapshot
     private PriceBook(@NotNull final Table table,
                       @NotNull final Table snapshot,
                       final int depth,
@@ -178,34 +175,24 @@ public class PriceBook {
         final MutableObject<QueryTable> result = new MutableObject<>();
         final MutableObject<BookListener> listenerHolder = new MutableObject<>();
 
-
-        // Process state here and just make a copy in the initializeWithSnapshot context, 
-        // so we dont keep re-processing things if that init fails
+        // Process state from snapshot here and just make a copy in the initializeWithSnapshot
+        // context, so we dont keep re-processing things if that init fails
         final Map<Object, BookState> tempStates = processInitBook(snapshot, groupingCols);
-        final TupleSource snapKeySource = TupleSourceFactory.makeTupleSource(Arrays.stream(groupingCols).map(snapshot::getColumnSource).toArray(ColumnSource[]::new));
-        final Context ctx = new Context(depth);
-
-
-        System.out.println(tempStates);
-        System.out.println(snapKeySource.tupleLength());
         
-        int sizeOfTupleSource = snapKeySource.tupleLength(); //This is just 1, wont work
+        // Record changes to initialize the output table
+        final Context ctx = new Context(depth);
         Instant timeNow = Instant.now();
         long timeNowNanos = timeNow.getEpochSecond() * 1000000000 + timeNow.getNano();
-        for (int i=0; i < sizeOfTupleSource; i++) {
-
-            Object key = snapKeySource.createTuple(i);
-            BookState entry = tempStates.get(key);
-            recordChange(ctx, entry, timeNowNanos, key);
+        for (var entry : tempStates.entrySet()) {
+            recordChange(ctx, entry.getValue(), timeNowNanos, entry.getKey());
         }
 
+        // Keep track of rows
         final long lastRow = ctx.rowsAdded;
-        System.out.println(lastRow);
 
         // result table will be the snapshot + any new data from the source
         QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
                 (prevRequested, beforeClock) -> {
-                    System.out.println("In snapshot control");
 
                     // Deep copy states
                     this.states = tempStates.entrySet()
@@ -220,14 +207,13 @@ public class PriceBook {
                     // the LTM thread and so it must know if it should use previous values or current values.
                     final long rowsAdded = lastRow + processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev); // 
 
-                    //nit from snapshot. columnSourceMap has all the data from the book snapshot. lastRow?
+                    // New book table
                     final QueryTable bookTable = new QueryTable(
                             (rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1)).toTracking()
                             , columnSourceMap);
 
 
                     if (snapshotControl != null) {
-                        System.out.println("Snap is not null");
                         columnSourceMap.values().forEach(ColumnSource::startTrackingPrevValues);
                         bookTable.setRefreshing(true);
                         bookTable.setAttribute(Table.BLINK_TABLE_ATTRIBUTE, true);
@@ -249,10 +235,8 @@ public class PriceBook {
                         listenerHolder.set(bl);
                     }
                     result.set(bookTable);
-                    System.out.println("Set book table");
                     return true;
                 });
-        // tempStates = null;
 
         this.resultTable = result.get();
         this.resultIndex = resultTable.getRowSet().writableCast();
@@ -262,9 +246,9 @@ public class PriceBook {
         } else {
             bookListener = null;
         }
-        System.out.println("Done init");
     }
 
+    // Price book without snapshot
     private PriceBook(@NotNull final Table table,
                       final int depth,
                       final boolean batchTimestamps,
@@ -341,7 +325,6 @@ public class PriceBook {
                     // the LTM thread and so it must know if it should use previous values or current values.
                     final long rowsAdded = processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev);
 
-                    // TODO: init from snapshot
                     final QueryTable bookTable = new QueryTable(
                             (rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1)).toTracking()
                             , columnSourceMap);
@@ -371,7 +354,6 @@ public class PriceBook {
                     return true;
                 });
 
-        // TODO: Do I just set the snapshot to the result table?
         this.resultTable = result.get();
         this.resultIndex = resultTable.getRowSet().writableCast();
         if(source.isRefreshing()) {
@@ -380,7 +362,6 @@ public class PriceBook {
         } else {
             bookListener = null;
         }
-        System.out.println(this.states);
     }
 
     /**
@@ -489,6 +470,13 @@ public class PriceBook {
         }
     }
 
+    /**
+     * Process all rows from a book table snapshot
+     *
+     * @param t the snapshot of the book table
+     * @param groupings the grouping columns of the book table
+     * @return the Map of grouping keys to BookState
+     */
     final Map<Object, BookState> processInitBook(final Table t, String... groupings) {
         final Map<Object, BookState> initStates = new HashMap<>();
 
@@ -674,7 +662,6 @@ public class PriceBook {
                 bestPrices.add(priceArr[ii]);
             }
 
-            // Do I initialize overflow too?
             overflowPrices = new PriorityQueue<>(comparator);
         }
 
@@ -691,7 +678,7 @@ public class PriceBook {
         }
 
 
-        // Copy constructor
+        // Constructor for copy
         Book(int depth, 
                 Comparator<Double> comparator, 
                 Double2IntOpenHashMap sizeMap, 
@@ -709,7 +696,6 @@ public class PriceBook {
             this.overflowPrices = overflowPrices;
         }
 
-        // make a deep copy of the Book
         private Book deepCopy() {
 
             MinMaxPriorityQueue<Double> bestPricesCopy = MinMaxPriorityQueue.create();
@@ -1114,7 +1100,7 @@ public class PriceBook {
                                    @NotNull String opColumnName,
                                    @NotNull String priceColumnName,
                                    @NotNull String... groupingCols) {
-        // TODO: Add nullable table input or diff constructor with a snapshot table
+
         final PriceBook book = new PriceBook(source,
                 depth,
                 batchTimestamps,
@@ -1156,7 +1142,6 @@ public class PriceBook {
                                    @NotNull String opColumnName,
                                    @NotNull String priceColumnName,
                                    @NotNull String... groupingCols) {
-        // TODO: Add nullable table input or diff constructor with a snapshot table
         final PriceBook book = new PriceBook(source,
                 snapshot,
                 depth,
