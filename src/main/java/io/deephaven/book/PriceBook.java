@@ -218,7 +218,7 @@ public class PriceBook {
 
                     // New book table
                     final QueryTable bookTable = new QueryTable(
-                            (rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1)).toTracking()
+                            (RowSetFactory.flat(rowsAdded)).toTracking()
                             , columnSourceMap);
 
 
@@ -372,8 +372,10 @@ public class PriceBook {
      * @return the Map of grouping keys to BookState
      */
     final Map<Object, BookState> processInitBook(final Table t, String... groupings) {
-        final Map<Object, BookState> initStates = new HashMap<>();
+        // Must be static
+        assert !t.isRefreshing();
 
+        final Map<Object, BookState> initStates = new HashMap<>();
         final ColumnSource<long[]> bidTSSource = t.getColumnSource(BID_TIME_NAME);
         final ColumnSource<long[]> askTSSource = t.getColumnSource(ASK_TIME_NAME);
         final ColumnSource<int[]> bidSizesSource = t.getColumnSource(BID_SIZE_NAME);
@@ -426,14 +428,19 @@ public class PriceBook {
                     final int finalII = ii;
                     final Object key = snapKeySource.createTuple(finalII);
 
-                    initStates.put(key, new BookState(depth,
-                            context.bidTimeChunk.get(ii),
-                            context.askTimeChunk.get(ii),
-                            context.bidSizeChunk.get(ii),
-                            context.askSizeChunk.get(ii),
-                            context.bidPriceChunk.get(ii),
-                            context.askPriceChunk.get(ii)
-                            ));
+                    if (initStates.get(key) == null) {
+                        initStates.put(key, new BookState(depth,
+                                context.bidTimeChunk.get(ii),
+                                context.askTimeChunk.get(ii),
+                                context.bidSizeChunk.get(ii),
+                                context.askSizeChunk.get(ii),
+                                context.bidPriceChunk.get(ii),
+                                context.askPriceChunk.get(ii)
+                                ));
+
+                    } else {
+                        throw new IllegalArgumentException("Input book must have only one key per row");
+                    }
                 }
             }
         }
