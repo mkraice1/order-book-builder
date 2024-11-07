@@ -144,7 +144,6 @@ public class PriceBook {
         timeResult = new InstantArraySource();
         columnSourceMap.put("Timestamp", timeResult);
 
-
         keyOutputSources = new WritableColumnSource[groupingCols.length];
         for(int ii = 0; ii < groupingCols.length; ii++) {
             final String groupingColName = groupingCols[ii];
