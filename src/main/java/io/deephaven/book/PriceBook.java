@@ -16,6 +16,7 @@ import it.unimi.dsi.fastutil.doubles.Double2LongOpenHashMap;
 import org.jetbrains.annotations.NotNull;
 import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
 
+import io.deephaven.time.DateTimeUtils;
 import java.time.Instant;
 import java.util.stream.Collectors;
 import java.util.*;
@@ -107,7 +108,7 @@ public class PriceBook {
     private final boolean sourceIsBlink;
 
     private PriceBook(@NotNull final Table table,
-                      @NotNull final Table snapshot,
+                      final Table snapshot,
                       final int depth,
                       final boolean batchTimestamps,
                       @NotNull String timestampColumnName,
@@ -122,7 +123,7 @@ public class PriceBook {
         this.sourceIsBlink = BlinkTableTools.isBlink(source);
 
         // Need to set states
-        this.states = null;
+        this.states = new HashMap<>();
 
 
         // Begin by getting references to the column sources from the input table to process later.
@@ -174,38 +175,46 @@ public class PriceBook {
 
         final MutableObject<QueryTable> result = new MutableObject<>();
         final MutableObject<BookListener> listenerHolder = new MutableObject<>();
+        final long initialRowCount;
+        final Map<Object, BookState> tempStates;
 
-        // Process state from snapshot here and just make a copy in the initializeWithSnapshot
-        // context, so we dont keep re-processing things if that init fails
-        final Map<Object, BookState> tempStates = processInitBook(snapshot, groupingCols);
-        
-        // Record changes to initialize the output table
-        final Context ctx = new Context(depth);
-        Instant timeNow = Instant.now();
-        long timeNowNanos = timeNow.getEpochSecond() * 1000000000 + timeNow.getNano();
-        for (var entry : tempStates.entrySet()) {
-            recordChange(ctx, entry.getValue(), timeNowNanos, entry.getKey());
+        if (snapshot != null) {
+            // Process state from snapshot here and just make a copy in the initializeWithSnapshot
+            // context, so we dont keep re-processing things if that init fails
+            tempStates = processInitBook(snapshot, groupingCols);
+
+            // Record changes to initialize the output table
+            final Context ctx = new Context(depth);
+            final long timeNowNanos = DateTimeUtils.epochNanos(DateTimeUtils.now());
+            for (var entry : tempStates.entrySet()) {
+                recordChange(ctx, entry.getValue(), timeNowNanos, entry.getKey());
+            }
+
+            // Keep track of rows
+            initialRowCount = ctx.rowsAdded;
+        } else {
+            tempStates = null;
+            initialRowCount = 0;
         }
-
-        // Keep track of rows
-        final long lastRow = ctx.rowsAdded;
 
         // result table will be the snapshot + any new data from the source
         QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
                 (prevRequested, beforeClock) -> {
 
                     // Deep copy states
-                    this.states = tempStates.entrySet()
-                                .stream()
-                                .collect(Collectors.toMap(
-                                    Map.Entry::getKey,
-                                    entry -> entry.getValue().deepCopy()));
+                    if (snapshot != null && snapshotControl != null) {
+                        this.states = tempStates.entrySet()
+                                    .stream()
+                                    .collect(Collectors.toMap(
+                                        Map.Entry::getKey,
+                                        entry -> entry.getValue().deepCopy()));
+                    }
 
                     final boolean usePrev = prevRequested && source.isRefreshing();
 
                     // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
                     // the LTM thread and so it must know if it should use previous values or current values.
-                    final long rowsAdded = lastRow + processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev); // 
+                    final long rowsAdded = initialRowCount + processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev); // 
 
                     // New book table
                     final QueryTable bookTable = new QueryTable(
@@ -248,121 +257,6 @@ public class PriceBook {
         }
     }
 
-    // Price book without snapshot
-    private PriceBook(@NotNull final Table table,
-                      final int depth,
-                      final boolean batchTimestamps,
-                      @NotNull String timestampColumnName,
-                      @NotNull String sizeColumnName,
-                      @NotNull String sideColumnName,
-                      @NotNull String opColumnName,
-                      @NotNull String priceColumnName,
-                      @NotNull String... groupingCols) {
-        final QueryTable source = (QueryTable) table.coalesce();
-        this.batchTimestamps = batchTimestamps;
-        this.depth = depth;
-        this.sourceIsBlink = BlinkTableTools.isBlink(source);
-
-        this.states = new HashMap<>();
-
-        // Begin by getting references to the column sources from the input table to process later.
-        this.timeSource = ReinterpretUtils.instantToLongSource(source.getColumnSource(timestampColumnName));
-        this.priceSource = source.getColumnSource(priceColumnName);
-        this.sizeSource = source.getColumnSource(sizeColumnName);
-        this.sideSource = source.getColumnSource(sideColumnName);
-        this.opSource = source.getColumnSource(opColumnName);
-
-        // Since we may group by more than one column (say Symbol, Exchange) we want to create a single key object to look into
-        // the book state map.  Packing the key sources into a tuple does this neatly.
-        this.keySource = TupleSourceFactory.makeTupleSource(Arrays.stream(groupingCols).map(source::getColumnSource).toArray(ColumnSource[]::new));
-
-        // Construct the new column sources and result table.
-        final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
-
-
-        // Now we create the columns which will be in the output table
-        timeResult = new InstantArraySource();
-        columnSourceMap.put("Timestamp", timeResult);
-
-        // Shouldn't need to do ths?
-        keyOutputSources = new WritableColumnSource[groupingCols.length];
-        for(int ii = 0; ii < groupingCols.length; ii++) {
-            final String groupingColName = groupingCols[ii];
-            final ColumnSource<?> gsCol = source.getColumnSource(groupingColName);
-            keyOutputSources[ii] = ArrayBackedColumnSource.getMemoryColumnSource(gsCol.getType(), gsCol.getComponentType());
-            columnSourceMap.put(groupingColName, keyOutputSources[ii]);
-        }
-
-        // The number of Price/Timestamp/Size columns is twice the requested book depth,  one set for
-        // bids, and one set for asks.
-        bidPriceResults = new ObjectArraySource<>(double[].class);
-        bidTimeResults = new ObjectArraySource<>(long[].class);
-        bidSizeResults = new ObjectArraySource<>(int[].class);
-        columnSourceMap.put(BID_PRC_NAME, bidPriceResults);
-        columnSourceMap.put(BID_TIME_NAME, bidTimeResults);
-        columnSourceMap.put(BID_SIZE_NAME, bidSizeResults);
-
-        askPriceResults = new ObjectArraySource<>(double[].class);
-        askTimeResults = new ObjectArraySource<>(long[].class);
-        askSizeResults = new ObjectArraySource<>(int[].class);
-        columnSourceMap.put(ASK_PRC_NAME, askPriceResults);
-        columnSourceMap.put(ASK_TIME_NAME, askTimeResults);
-        columnSourceMap.put(ASK_SIZE_NAME, askSizeResults);
-
-        // Finally, create the result table for the user
-        final OperationSnapshotControl snapshotControl =
-                source.createSnapshotControlIfRefreshing(OperationSnapshotControl::new);
-
-        final MutableObject<QueryTable> result = new MutableObject<>();
-        final MutableObject<BookListener> listenerHolder = new MutableObject<>();
-
-
-        QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
-                (prevRequested, beforeClock) -> {
-                    final boolean usePrev = prevRequested && source.isRefreshing();
-
-                    // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
-                    // the LTM thread and so it must know if it should use previous values or current values.
-                    final long rowsAdded = processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev);
-
-                    final QueryTable bookTable = new QueryTable(
-                            (rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1)).toTracking()
-                            , columnSourceMap);
-
-                    if (snapshotControl != null) {
-                        columnSourceMap.values().forEach(ColumnSource::startTrackingPrevValues);
-                        bookTable.setRefreshing(true);
-                        bookTable.setAttribute(Table.BLINK_TABLE_ATTRIBUTE, true);
-                        bookTable.getRowSet().writableCast().initializePreviousValue();
-
-                        // To Produce a blink table we need to be able to respond to upstream changes when they exist
-                        // and we also need to be able to produce downstream updates, even if upstream did NOT change.
-                        // This is what the ListenerRecorder and MergedListener (BookListener) are for.  The
-                        // ListenerRecorder will simply record any TableUpdate produced by the source and notify the
-                        // MergedListener (BookListener) that something happened.
-                        // The BookListener will wait for both the UpdateGraphProcessor AND the ListenerRecorder to
-                        // be satisfied before it does process().  This way, we properly handle upstream ticks, and
-                        // also properly blink out rows when there are no updates.
-                        final ListenerRecorder recorder = new ListenerRecorder("BookBuilderListenerRecorder", source, null);
-                        final BookListener bl = new BookListener(recorder, source, bookTable);
-                        recorder.setMergedListener(bl);
-                        bookTable.addParentReference(bl);
-                        snapshotControl.setListenerAndResult(recorder, bookTable);
-                        listenerHolder.set(bl);
-                    }
-                    result.set(bookTable);
-                    return true;
-                });
-
-        this.resultTable = result.get();
-        this.resultIndex = resultTable.getRowSet().writableCast();
-        if(source.isRefreshing()) {
-            this.bookListener = listenerHolder.get();
-            bookListener.getUpdateGraph().addSource(bookListener);
-        } else {
-            bookListener = null;
-        }
-    }
 
     /**
      * Process all the added rows, potentially using previous values.
@@ -1074,45 +968,6 @@ public class PriceBook {
         }
     }
 
-    /**
-     * Build a book of bid and ask prices with the specified number of levels from the requested table, grouping input rows by the
-     * specified set of grouping columns.  Levels will be represented as a set of columns (Price, Time, Size) for each level.
-     *
-     * @param source the table with the source data
-     * @param depth the desired book depth
-     * @param batchTimestamps set to true to batch input rows with identical timestamps into the a single output row.
-     * @param timestampColumnName the name of the source timestamp column
-     * @param sizeColumnName the name of the source size column
-     * @param sideColumnName the name of the source side column
-     * @param opColumnName the name of the source book-op column
-     * @param priceColumnName the name of the price column
-     * @param groupingCols the columns to group the source table by
-     *
-     * @return a new table representing the current state of the book.  This table will update as the source table updates.
-     */
-    @SuppressWarnings("unused")
-    public static QueryTable build(@NotNull Table source,
-                                   int depth,
-                                   boolean batchTimestamps,
-                                   @NotNull String timestampColumnName,
-                                   @NotNull String sizeColumnName,
-                                   @NotNull String sideColumnName,
-                                   @NotNull String opColumnName,
-                                   @NotNull String priceColumnName,
-                                   @NotNull String... groupingCols) {
-
-        final PriceBook book = new PriceBook(source,
-                depth,
-                batchTimestamps,
-                timestampColumnName,
-                sizeColumnName,
-                sideColumnName,
-                opColumnName,
-                priceColumnName,
-                groupingCols);
-
-        return book.resultTable;
-    }
 
     /**
      * Build a book of bid and ask prices with the specified number of levels from the requested table, grouping input rows by the
@@ -1133,7 +988,7 @@ public class PriceBook {
      */
     @SuppressWarnings("unused")
     public static QueryTable build(@NotNull Table source,
-                                   @NotNull Table snapshot,
+                                   Table snapshot,
                                    int depth,
                                    boolean batchTimestamps,
                                    @NotNull String timestampColumnName,
