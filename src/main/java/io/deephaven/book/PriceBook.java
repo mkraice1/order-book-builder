@@ -43,7 +43,7 @@ import java.util.*;
  *     By default, the PriceBook will group input rows that have identical timestamps into a single emitted output row.
  *     If this is not the desired behavior, or you require more fine grained control of the columns used to build the book
  *     you may use the more specific builder method
- *     {@link #build(Table, int, boolean, String, String, String, String, String, String...)}
+ *     {@link #build(Table, Table, int, boolean, String, String, String, String, String, String...)}
  * </p>
  * <p></p>
  * <p>
@@ -176,6 +176,7 @@ public class PriceBook {
         final MutableObject<BookListener> listenerHolder = new MutableObject<>();
         final long initialRowCount;
         final Map<Object, BookState> tempStates;
+        final Context ctx = new Context(depth);
 
         if (snapshot != null) {
             // Process state from snapshot here and just make a copy in the initializeWithSnapshot
@@ -183,7 +184,6 @@ public class PriceBook {
             tempStates = processInitBook(snapshot, groupingCols);
 
             // Record changes to initialize the output table
-            final Context ctx = new Context(depth);
             final long timeNowNanos = DateTimeUtils.epochNanos(DateTimeUtils.now());
             for (var entry : tempStates.entrySet()) {
                 recordChange(ctx, entry.getValue(), timeNowNanos, entry.getKey());
@@ -191,10 +191,12 @@ public class PriceBook {
 
             // Keep track of rows
             initialRowCount = ctx.rowsAdded;
+
         } else {
             tempStates = null;
             initialRowCount = 0;
         }
+
 
         // result table will be the snapshot + any new data from the source
         QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
@@ -213,11 +215,12 @@ public class PriceBook {
 
                     // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
                     // the LTM thread and so it must know if it should use previous values or current values.
-                    final long rowsAdded = initialRowCount + processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev); // 
+                    processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev, ctx); //
+
 
                     // New book table
                     final QueryTable bookTable = new QueryTable(
-                            (RowSetFactory.flat(rowsAdded)).toTracking()
+                            (RowSetFactory.flat(ctx.rowsAdded)).toTracking()
                             , columnSourceMap);
 
 
@@ -254,7 +257,7 @@ public class PriceBook {
         } else {
             bookListener = null;
         }
-    }
+}
 
 
     /**
@@ -265,9 +268,9 @@ public class PriceBook {
      * @return the number of new rows emitted to the result.
      */
     @SuppressWarnings("unchecked")
-    private long processAdded(RowSet added, boolean usePrev) {
+    private long processAdded(RowSet added, boolean usePrev, Context ctx_) {
         // First create the context object in a try-with-resources so it gets automatically cleaned up when we're done.
-        try(final Context ctx = new Context(depth)) {
+        try(final Context ctx = ctx_ == null ? new Context(depth) : ctx_) {
             // Next we get an iterator into the added index so that we can process the update in chunks.
             final RowSequence.Iterator okit = added.getRowSequenceIterator();
 
@@ -953,7 +956,7 @@ public class PriceBook {
                 }
 
                 // First process all of the new rows
-                final long rowsAdded = processAdded(upstream.added(), false);
+                final long rowsAdded = processAdded(upstream.added(), false, null);
 
                 // Handle the case where the input rows generate no book state changes,  we don't want to accidentally
                 // try to inject a -1 into the row set.
