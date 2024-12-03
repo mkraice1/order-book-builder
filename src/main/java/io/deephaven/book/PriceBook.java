@@ -1,3 +1,7 @@
+
+// Should we just log the book+lastBy to a system table instead of taking snapshots?
+
+
 package io.deephaven.book;
 
 
