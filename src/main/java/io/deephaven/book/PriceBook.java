@@ -47,13 +47,13 @@ import java.util.*;
  *     By default, the PriceBook will group input rows that have identical timestamps into a single emitted output row.
  *     If this is not the desired behavior, or you require more fine grained control of the columns used to build the book
  *     you may use the more specific builder method
- *     {@link #build(Table, Table, int, boolean, String, String, String, String, String, String...)}
+ *     {@link #build(Table, Table, int, boolean, String, String, String, String, String, String, String...)}
  * </p>
  * <p></p>
  * <p>
  *      The following example creates a book of depth 5, that does NOT group identical timestamps, and groups input rows by "Symbol" and "Exchange"
  *      <pre>{@code
- *      book = PriceBook.build(orderStream, 5, false, "Timestamp", "OrderSize", "OrderSize", "BookOp", "Price", "Symbol", "Exchange")
+ *      book = PriceBook.build(orderStream, 5, false, "Timestamp", "OrderSize", "OrderSize", "BookOp", "Price", "OrderId", "Symbol", "Exchange")
  *      }</pre>
  *
  */
@@ -72,10 +72,12 @@ public class PriceBook {
     private static final String BID_PRC_NAME = "Bid_Price";
     private static final String BID_TIME_NAME = "Bid_Timestamp";
     private static final String BID_SIZE_NAME = "Bid_Size";
+    private static final String BID_ORDID_NAME = "Bid_OrderId";
 
     private static final String ASK_PRC_NAME = "Ask_Price";
     private static final String ASK_TIME_NAME = "Ask_Timestamp";
     private static final String ASK_SIZE_NAME = "Ask_Size";
+    private static final String ASK_ORDID_NAME = "Ask_OrderId";
 
     private Map<Object, BookState> states;
     private final boolean batchTimestamps;
@@ -87,6 +89,7 @@ public class PriceBook {
     private final ColumnSource<Integer> sizeSource;
     private final ColumnSource<Integer> sideSource;
     private final ColumnSource<Integer> opSource;
+    private final ColumnSource<Long> ordIdSource;
 
     private final TupleSource keySource;
     // endregion
@@ -102,10 +105,12 @@ public class PriceBook {
     final ObjectArraySource<double[]> bidPriceResults;
     final ObjectArraySource<long[]> bidTimeResults;
     final ObjectArraySource<int[]> bidSizeResults;
+    final ObjectArraySource<long[]> bidOrdIdResults;
 
     final ObjectArraySource<double[]> askPriceResults;
     final ObjectArraySource<long[]> askTimeResults;
     final ObjectArraySource<int[]> askSizeResults;
+    final ObjectArraySource<long[]> askOrdIdResults;
 
     // endregion
 
@@ -120,6 +125,7 @@ public class PriceBook {
                       @NotNull String sideColumnName,
                       @NotNull String opColumnName,
                       @NotNull String priceColumnName,
+                      @NotNull String ordIdColumnName,
                       @NotNull String... groupingCols) {
         final QueryTable source = (QueryTable) table.coalesce();
         this.batchTimestamps = batchTimestamps;
@@ -136,6 +142,7 @@ public class PriceBook {
         this.sizeSource = source.getColumnSource(sizeColumnName);
         this.sideSource = source.getColumnSource(sideColumnName);
         this.opSource = source.getColumnSource(opColumnName);
+        this.ordIdSource = source.getColumnSource(ordIdColumnName);
 
         // Since we may group by more than one column (say Symbol, Exchange) we want to create a single key object to look into
         // the book state map.  Packing the key sources into a tuple does this neatly.
@@ -161,16 +168,20 @@ public class PriceBook {
         bidPriceResults = new ObjectArraySource<>(double[].class);
         bidTimeResults = new ObjectArraySource<>(long[].class);
         bidSizeResults = new ObjectArraySource<>(int[].class);
+        bidOrdIdResults = new ObjectArraySource<>(long[].class);
         columnSourceMap.put(BID_PRC_NAME, bidPriceResults);
         columnSourceMap.put(BID_TIME_NAME, bidTimeResults);
         columnSourceMap.put(BID_SIZE_NAME, bidSizeResults);
+        columnSourceMap.put(BID_ORDID_NAME, bidOrdIdResults);
 
         askPriceResults = new ObjectArraySource<>(double[].class);
         askTimeResults = new ObjectArraySource<>(long[].class);
         askSizeResults = new ObjectArraySource<>(int[].class);
+        askOrdIdResults = new ObjectArraySource<>(long[].class);
         columnSourceMap.put(ASK_PRC_NAME, askPriceResults);
         columnSourceMap.put(ASK_TIME_NAME, askTimeResults);
         columnSourceMap.put(ASK_SIZE_NAME, askSizeResults);
+        columnSourceMap.put(ASK_ORDID_NAME, askOrdIdResults);
 
         // Set result table
         final OperationSnapshotControl snapshotControl =
@@ -285,6 +296,7 @@ public class PriceBook {
             final ChunkSource.FillContext sizefc = ctx.makeFillContext(sizeSource);
             final ChunkSource.FillContext sidefc = ctx.makeFillContext(sideSource);
             final ChunkSource.FillContext opfc = ctx.makeFillContext(opSource);
+            final ChunkSource.FillContext oifc = ctx.makeFillContext(ordIdSource);
             final ChunkSource.FillContext keyfc = ctx.makeFillContext(keySource);
 
             BookState currentState = null;
@@ -306,6 +318,7 @@ public class PriceBook {
                     sideSource.fillPrevChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
                     sizeSource.fillPrevChunk(sizefc, (WritableChunk<? super Values>) ctx.sizeChunk, nextKeys);
                     priceSource.fillPrevChunk(pricefc, (WritableChunk<? super Values>) ctx.priceChunk, nextKeys);
+                    ordIdSource.fillPrevChunk(oifc, (WritableChunk<? super Values>) ctx.ordIdChunk, nextKeys);
                     timeSource.fillPrevChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
                 } else {
                     keySource.fillChunk(keyfc, (WritableChunk<? super Values>) ctx.keyChunk, nextKeys);
@@ -313,6 +326,7 @@ public class PriceBook {
                     sideSource.fillChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
                     sizeSource.fillChunk(sizefc, (WritableChunk<? super Values>) ctx.sizeChunk, nextKeys);
                     priceSource.fillChunk(pricefc, (WritableChunk<? super Values>) ctx.priceChunk, nextKeys);
+                    ordIdSource.fillChunk(pricefc, (WritableChunk<? super Values>) ctx.ordIdChunk, nextKeys);
                     timeSource.fillChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
                 }
 
@@ -342,9 +356,10 @@ public class PriceBook {
                     final int size = ctx.sizeChunk.get(ii);
                     final int side = ctx.sideChunk.get(ii);
                     final int op = ctx.opChunk.get(ii);
+                    final long ordId = ctx.ordIdChunk.get(ii);
                     final long timestamp = ctx.timeChunk.get(ii);
 
-                    batchUpdated |= currentState.update(timestamp, price, size, side, op);
+                    batchUpdated |= currentState.update(timestamp, price, size, side, op, ordId);
 
                     // We should only log a row if we are either not batching,  or the timestamp changed
                     final boolean logRowGate = (!batchTimestamps || timestamp != lastTime);
@@ -388,6 +403,8 @@ public class PriceBook {
         final ColumnSource<int[]> askSizesSource = t.getColumnSource(ASK_SIZE_NAME);
         final ColumnSource<double[]> bidsSource = t.getColumnSource(BID_PRC_NAME);
         final ColumnSource<double[]> asksSource = t.getColumnSource(ASK_PRC_NAME);
+        final ColumnSource<long[]> bidOrdIdSource = t.getColumnSource(BID_ORDID_NAME);
+        final ColumnSource<long[]> askOrdIdSource = t.getColumnSource(ASK_ORDID_NAME);
 
 
         final List<ColumnSource<?>> groupingSources = new ArrayList<>();
@@ -408,6 +425,8 @@ public class PriceBook {
             final ChunkSource.FillContext askSizeFc = context.makeFillContext(askSizesSource);
             final ChunkSource.FillContext bidPriceFc = context.makeFillContext(bidsSource);
             final ChunkSource.FillContext askPriceFc = context.makeFillContext(asksSource);
+            final ChunkSource.FillContext bidOrdIdFc = context.makeFillContext(bidOrdIdSource);
+            final ChunkSource.FillContext askOrdIdFc = context.makeFillContext(askOrdIdSource);
             final ChunkSource.FillContext[] groupingfc = new ChunkSource.FillContext[groupingSources.size()];
             for (int i = 0; i < groupingSources.size(); i++) {
                 groupingfc[i] = context.makeFillContext(groupingSources.get(i));
@@ -425,6 +444,8 @@ public class PriceBook {
                 askSizesSource.fillChunk(askSizeFc, (WritableChunk<? super Values>) context.askSizeChunk, nextKeys);
                 bidsSource.fillChunk(bidPriceFc, (WritableChunk<? super Values>) context.bidPriceChunk, nextKeys);
                 asksSource.fillChunk(askPriceFc, (WritableChunk<? super Values>) context.askPriceChunk, nextKeys);
+                bidOrdIdSource.fillChunk(bidOrdIdFc, (WritableChunk<? super Values>) context.bidOrdIdChunk, nextKeys);
+                askOrdIdSource.fillChunk(askOrdIdFc, (WritableChunk<? super Values>) context.askOrdIdChunk, nextKeys);
 
                 for (int i = 0; i < groupingSources.size(); i++) {
                     groupingSources.get(i).fillChunk(groupingfc[i], (WritableChunk<? super Values>) context.groupingChunks.get(i), nextKeys);
@@ -441,7 +462,9 @@ public class PriceBook {
                                 context.bidSizeChunk.get(ii),
                                 context.askSizeChunk.get(ii),
                                 context.bidPriceChunk.get(ii),
-                                context.askPriceChunk.get(ii)
+                                context.askPriceChunk.get(ii),
+                                context.bidOrdIdChunk.get(ii),
+                                context.askOrdIdChunk.get(ii)
                                 ));
 
                     } else {
@@ -479,11 +502,11 @@ public class PriceBook {
 
         // Fill out the bid columns
         fillFrom(nextIndex, newSize, state.bids, ctx, Comparator.reverseOrder(),
-                bidPriceResults, bidTimeResults, bidSizeResults);
+                bidPriceResults, bidTimeResults, bidSizeResults, bidOrdIdResults);
 
         // Fill out the ask columns
         fillFrom(nextIndex, newSize, state.asks, ctx, Comparator.naturalOrder(),
-                askPriceResults, askTimeResults, askSizeResults);
+                askPriceResults, askTimeResults, askSizeResults, askOrdIdResults);
 
         // Increment the number of rows added.
         ctx.rowsAdded++;
@@ -506,11 +529,13 @@ public class PriceBook {
                           Comparator<? super Double> comparator,
                           WritableColumnSource<double[]> priceDestination,
                           WritableColumnSource<long[]> timeDestination,
-                          WritableColumnSource<int[]> sizeDestination) {
+                          WritableColumnSource<int[]> sizeDestination,
+                          WritableColumnSource<long[]> ordIdDestination) {
         final int count = book.bestPrices.size();
         final double[] prices = new double[count];
         final long[] times = new long[count];
         final int[] sizes = new int[count];
+        final long[] ordIds = new long[count];
         // First copy the best prices from the book into our temporary array and sort it appropriately
         Arrays.sort(book.bestPrices.toArray(ctx.priceBuf), 0, book.bestPrices.size(), comparator);
 
@@ -520,6 +545,7 @@ public class PriceBook {
             prices[ii] = price;
             times[ii] = book.timestampMap.get(price);
             sizes[ii] = book.sizeMap.get(price);
+            ordIds[ii] = book.ordIdMap.get(price);
         }
 
         priceDestination.ensureCapacity(newSize);
@@ -530,6 +556,9 @@ public class PriceBook {
 
         sizeDestination.ensureCapacity(newSize);
         sizeDestination.set(destination, sizes);
+
+        ordIdDestination.ensureCapacity(newSize);
+        ordIdDestination.set(destination, ordIds);
     }
 
     /**
@@ -546,6 +575,7 @@ public class PriceBook {
         private final PriorityQueue<Double> overflowPrices;
         private final Double2IntOpenHashMap sizeMap;
         private final Double2LongOpenHashMap timestampMap;
+        private final Double2LongOpenHashMap ordIdMap;
 
         private final int depth;
         private final Comparator<Double> comparator;
@@ -554,14 +584,17 @@ public class PriceBook {
                 Comparator<Double> comparator, 
                 long[] timeArr, 
                 int[] sizeArr,
-                double[] priceArr) {
+                double[] priceArr,
+                long[] ordIdArr) {
 
             this.depth = depth;
             this.comparator = comparator;
             this.sizeMap = new Double2IntOpenHashMap(priceArr, sizeArr);
             this.timestampMap = new Double2LongOpenHashMap(priceArr, timeArr);
+            this.ordIdMap = new Double2LongOpenHashMap(priceArr, ordIdArr);
             this.sizeMap.defaultReturnValue(-1);
             this.timestampMap.defaultReturnValue(-1);
+            this.ordIdMap.defaultReturnValue(-1);
 
             // Insert prices into minmax q ...
             bestPrices = MinMaxPriorityQueue.orderedBy(comparator).maximumSize(depth).create();
@@ -578,8 +611,10 @@ public class PriceBook {
             this.comparator = comparator;
             this.sizeMap = new Double2IntOpenHashMap();
             this.timestampMap = new Double2LongOpenHashMap();
+            this.ordIdMap = new Double2LongOpenHashMap();
             this.sizeMap.defaultReturnValue(-1);
             this.timestampMap.defaultReturnValue(-1);
+            this.ordIdMap.defaultReturnValue(-1);
             bestPrices = MinMaxPriorityQueue.orderedBy(comparator).maximumSize(depth).create();
             overflowPrices = new PriorityQueue<>(comparator);
         }
@@ -589,16 +624,19 @@ public class PriceBook {
         Book(int depth, 
                 Comparator<Double> comparator, 
                 Double2IntOpenHashMap sizeMap, 
-                Double2LongOpenHashMap timestampMap, 
-                MinMaxPriorityQueue<Double> bestPrices, 
+                Double2LongOpenHashMap timestampMap,
+                Double2LongOpenHashMap ordIdMap,
+                MinMaxPriorityQueue<Double> bestPrices,
                 PriorityQueue overflowPrices) {
 
             this.depth = depth;
             this.comparator = comparator;
             this.sizeMap = sizeMap;
             this.timestampMap = timestampMap;
+            this.ordIdMap = ordIdMap;
             this.sizeMap.defaultReturnValue(-1);
             this.timestampMap.defaultReturnValue(-1);
+            this.ordIdMap.defaultReturnValue(-1);
             this.bestPrices = bestPrices;
             this.overflowPrices = overflowPrices;
         }
@@ -614,14 +652,15 @@ public class PriceBook {
 
             return new Book(this.depth, this.comparator, 
                 (Double2IntOpenHashMap) this.sizeMap.clone(), 
-                (Double2LongOpenHashMap) this.timestampMap.clone(), 
-                (MinMaxPriorityQueue<Double>) bestPricesCopy, 
+                (Double2LongOpenHashMap) this.timestampMap.clone(),
+                (Double2LongOpenHashMap) this.ordIdMap.clone(),
+                (MinMaxPriorityQueue<Double>) bestPricesCopy,
                 (PriorityQueue<Double>) overflowPricesCopy);
         }
 
 
         /**
-         * Update the specified price in the book.  If the price was new and larger than the any of the prices in the
+         * Update the specified price in the book.  If the price was new and larger than any of the prices in the
          * bestPrices queue, the last price in the bestPrices queue is moved to the backlog and the new price is inserted
          * into the bestPrices, otherwise it is inserted directly into the backlog.
          *
@@ -630,8 +669,9 @@ public class PriceBook {
          * @param time the order time
          * @return true of the price was added
          */
-        private boolean updatePrice(double price, int size, long time) {
+        private boolean updatePrice(double price, int size, long time, long ordId) {
             final long prevSize = sizeMap.put(price, size);
+            final long prevOrdId = ordIdMap.put(price, ordId);
             final long prevTime = timestampMap.put(price, time);
 
             // It's a new price!
@@ -651,7 +691,7 @@ public class PriceBook {
                 return true;
             }
 
-            return prevSize != size || prevTime != time;
+            return prevSize != size || prevTime != time || prevOrdId != ordId;
         }
 
         /**
@@ -678,6 +718,7 @@ public class PriceBook {
 
             sizeMap.remove(price);
             timestampMap.remove(price);
+            ordIdMap.remove(price);
 
             return wasRemoved;
         }
@@ -707,10 +748,12 @@ public class PriceBook {
                   int[] bidSizeArr,
                   int[] askSizeArr,
                   double[] bidPriceArr,
-                  double[] askPriceArr ) {
+                  double[] askPriceArr,
+                  long[] bidOrdIdArr,
+                  long[] askOrdIdArr) {
 
-            bids = new Book(depth, Comparator.reverseOrder(), bidTimeArr, bidSizeArr, bidPriceArr);
-            asks = new Book(depth, Comparator.naturalOrder(), askTimeArr, askSizeArr, askPriceArr);
+            bids = new Book(depth, Comparator.reverseOrder(), bidTimeArr, bidSizeArr, bidPriceArr, bidOrdIdArr);
+            asks = new Book(depth, Comparator.naturalOrder(), askTimeArr, askSizeArr, askPriceArr, askOrdIdArr);
          
         }
 
@@ -743,7 +786,8 @@ public class PriceBook {
                               final double price,
                               final int size,
                               final int side,
-                              final int op) {
+                              final int op,
+                              final long ordId) {
             final Book book = (side == SIDE_SELL) ? asks: bids;
 
             // Remove this price from the book entirely.
@@ -751,7 +795,7 @@ public class PriceBook {
                 return book.removeFrom(price);
             }
 
-            return book.updatePrice(price, size, time);
+            return book.updatePrice(price, size, time, ordId);
         }
     }
 
@@ -769,6 +813,7 @@ public class PriceBook {
         final WritableIntChunk<?> sizeChunk;
         final WritableIntChunk<?> sideChunk;
         final WritableIntChunk<?> opChunk;
+        final WritableLongChunk<?> ordIdChunk;
         final WritableObjectChunk<?, ? extends Values> keyChunk;
 
         /*
@@ -798,6 +843,7 @@ public class PriceBook {
             sizeChunk  = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
             sideChunk  = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
             opChunk    = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+            ordIdChunk = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
             keyChunk   = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
         }
 
@@ -814,6 +860,7 @@ public class PriceBook {
             sizeChunk.close();
             sideChunk.close();
             opChunk.close();
+            ordIdChunk.close();
             keyChunk.close();
         }
 
@@ -841,6 +888,8 @@ public class PriceBook {
         final WritableObjectChunk<int[], ?> askSizeChunk;
         final WritableObjectChunk<double[], ?> bidPriceChunk;
         final WritableObjectChunk<double[], ?> askPriceChunk;
+        final WritableObjectChunk<long[], ?> bidOrdIdChunk;
+        final WritableObjectChunk<long[], ?> askOrdIdChunk;
         final List<WritableObjectChunk<?, ?>> groupingChunks;
 
         /*
@@ -858,6 +907,8 @@ public class PriceBook {
             askSizeChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
             bidPriceChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
             askPriceChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            bidOrdIdChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            askOrdIdChunk = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
 
             groupingChunks = new ArrayList<>();
             for (int i = 0; i < groupingSources.size(); i++) {
@@ -880,6 +931,8 @@ public class PriceBook {
             askSizeChunk.close();
             bidPriceChunk.close();
             askPriceChunk.close();
+            bidOrdIdChunk.close();
+            askOrdIdChunk.close();
 
             for (final WritableChunk<?> chunk : groupingChunks) {
                 chunk.close();
@@ -995,6 +1048,7 @@ public class PriceBook {
      * @param sideColumnName the name of the source side column
      * @param opColumnName the name of the source book-op column
      * @param priceColumnName the name of the price column
+     * @param ordIdColumnName the name of the Order ID column
      * @param groupingCols the columns to group the source table by
      *
      * @return a new table representing the current state of the book.  This table will update as the source table updates.
@@ -1009,6 +1063,7 @@ public class PriceBook {
                                    @NotNull String sideColumnName,
                                    @NotNull String opColumnName,
                                    @NotNull String priceColumnName,
+                                   @NotNull String ordIdColumnName,
                                    @NotNull String... groupingCols) {
         final PriceBook book = new PriceBook(source,
                 snapshot,
@@ -1019,6 +1074,7 @@ public class PriceBook {
                 sideColumnName,
                 opColumnName,
                 priceColumnName,
+                ordIdColumnName,
                 groupingCols);
 
         return book.resultTable;

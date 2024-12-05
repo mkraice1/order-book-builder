@@ -6,6 +6,7 @@ from deephaven.numpy import to_numpy
 from deephaven import parquet as dhpq
 import zoneinfo
 
+
 from typing import Union, List
 import jpy
 from deephaven.table import Table
@@ -22,24 +23,26 @@ def build_book_with_snap(source: Table,
                side_col: str = "SIDE",
                op_col: str = "EVT_ID",
                price_col: str = "PRC",
+               ord_id_col: str = "ORD_ID",
                group_cols: Union[str, List[str]] = ["SYMB"]):
 
     if snapshot is not None:
         snapshot = snapshot.j_object
 
-    return Table(_J_BookBuilder.build(source.j_object, snapshot, book_depth, batch_timestamps, timestamp_col, size_col, side_col, op_col, price_col, group_cols))
+    return Table(_J_BookBuilder.build(source.j_object, snapshot, book_depth, batch_timestamps, timestamp_col, size_col, side_col, op_col, price_col, ord_id_col, group_cols))
 
 
 def prepare_data(start_time):
-        # OAK: new order ack; 
-        # CRAK: cancel replace ack; 
+        # OAK: new order ack;
+        # CRAK: cancel replace ack;
         # CC: order cancel;
-        # INF: internal fill; 
+        # INF: internal fill;
         # AWF: away market fill.
         EVT_map = {"Order Ack": 1, "Cancel Replace Ack" : 2, "Cancel Order": 3, "Internal Fill": 4, "Away Market Fill": 5}
 
-        order_sample = read_csv("/tmp/data/order_sample.csv").view(["EVT_TYP", "SYMB", "EPOCH_TS", "ORD_ID=CLIENT_ORD_ID", "ORD_QTY=QTY", "EXEC_QTY=(int) null", "CXL_QTY=(int) null", "PRC", "SIDE"])\
+        order_sample = read_csv("/tmp/data/order_sample.csv").view(["EVT_TYP", "FIRM= EPOCH_TS % 2 = 0 ? `Traders Inc` : `Big Bank Inc`", "SYMB", "EPOCH_TS", "ORD_ID=ORD_ID_PUB", "ORD_QTY=QTY", "EXEC_QTY=(int) null", "CXL_QTY=(int) null", "PRC", "SIDE"])\
                 .sort("EPOCH_TS")
+
 
         # Align timestamps to now
         now_time = start_time
