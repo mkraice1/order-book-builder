@@ -2,38 +2,32 @@ package io.deephaven.book;
 
 import java.lang.String;
 import java.time.Instant;
-import com.google.common.collect.MinMaxPriorityQueue;
 import io.deephaven.chunk.*;
 import io.deephaven.chunk.attributes.Values;
 import io.deephaven.engine.rowset.*;
-import io.deephaven.engine.rowset.impl.AdaptiveRowSetBuilderRandom;
 import io.deephaven.engine.table.*;
 import io.deephaven.engine.table.impl.*;
-import io.deephaven.engine.table.impl.sources.ArrayBackedColumnSource;
 import io.deephaven.engine.table.impl.sources.DoubleArraySource;
 import io.deephaven.engine.table.impl.sources.InstantArraySource;
 import io.deephaven.engine.table.impl.sources.IntegerArraySource;
 import io.deephaven.engine.table.impl.sources.ObjectArraySource;
 import io.deephaven.engine.table.impl.sources.LongArraySource;
 import io.deephaven.util.SafeCloseable;
-import it.unimi.dsi.fastutil.doubles.Double2IntOpenHashMap;
-import it.unimi.dsi.fastutil.doubles.Double2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
 import org.jetbrains.annotations.NotNull;
 import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
 
-
 import java.util.*;
 
 import static io.deephaven.util.QueryConstants.*;
 
 /**
- * <p>Build a book of the top N Bid/Ask prices in a columnar book format.</p>
+ * <p>Build a book of current live order</p>
  * <p>
- *     Creating a price book is as simple as invoking the static build method, specifying the columns to group on
- *     and the desired depth-of-book.
+ *     Creating a price book is as simple as invoking the static build method, specifying the column names of
+ *     your source table.
  *
  *      <pre>{@code
  *      import io.deephaven.book.PriceBook
@@ -42,46 +36,45 @@ import static io.deephaven.util.QueryConstants.*;
  *                      .where("Date=`2021-01-13`", "Time > '2021-01-13T08:30:00 NY'")
  *                      .sort("Time")
  *
- *      // Construct a book of depth 8, grouping prices by their Symbol
- *      // This will use the default columns "Time", "ORIG_SIZE", "BUY_SELL_FLAG", "BOOK_OP", "PRICE"
- *      book = PriceBook.build(orderStream, 8, "Symbol")
+ *      book = PriceBook.build(orderStream)
  *      }</pre>
  *
- * <p>
- *     By default, the PriceBook will group input rows that have identical timestamps into a single emitted output row.
- *     If this is not the desired behavior, or you require more fine grained control of the columns used to build the book
- *     you may use the more specific builder method
- *     {@link #build(Table, String, String, String, String, String, String, String)}
- * </p>
  * <p></p>
  * <p>
  *
  */
 public class PriceBook {
     private static final int CHUNK_SIZE = 2048;
-    private static final int SIDE_BUY = 0;
-    private static final int SIDE_SELL = 1;
+    private static final int SIDE_BUY = 1;
+    private static final int SIDE_SELL = 2;
 
-    private static final int OP_INSERT = 1;
-    private static final int OP_REMOVE = 2;
+    private static final int OP_OAK = 1;
+    private static final int OP_CC = 2;
+    private static final int OP_INF = 3;
+    private static final int OP_CRAK = 4;
 
+
+    // Names of the output table columns
+    private static final String UPDATE_TIME_NAME = "UpdateTimestamp";
     private static final String ORDID_NAME = "OrderId";
     private static final String SYM_NAME = "Symbol";
-    private static final String TIME_NAME = "Timestamp";
+    private static final String ORD_TIME_NAME = "OrderTimestamp";
     private static final String PRC_NAME = "Price";
     private static final String SIZE_NAME = "Size";
     private static final String SIDE_NAME = "Side";
 
 
     // region Input Sources
-    private final ColumnSource<Long> timeSource;
+    private final ColumnSource<Long> ordIdSource;
+    private final ColumnSource<Long> prevOrderIdSource;
+    private final ColumnSource<Long> orderTimeSource;
     private final ColumnSource<Double> priceSource;
     private final ColumnSource<Integer> sizeSource;
+    private final ColumnSource<Integer> execSizeSource;
     private final ColumnSource<Integer> sideSource;
     private final ColumnSource<Integer> opSource;
     private final ColumnSource<String> symSource;
 
-    private final ColumnSource<Long> ordIdSource;
     // endregion
 
     // region OutputSources
@@ -90,9 +83,9 @@ public class PriceBook {
 
     final TrackingWritableRowSet resultIndex;
 
-    final InstantArraySource updateTimeResult;
+    final InstantArraySource updateTimeResults;
     final DoubleArraySource priceResults;
-    final InstantArraySource timeResults;
+    final InstantArraySource orderTimeResults;
     final IntegerArraySource sizeResults;
     final IntegerArraySource sideResults;
     final LongArraySource ordIdResults;
@@ -104,7 +97,7 @@ public class PriceBook {
 
     private final Long2LongOpenHashMap orderMap = new Long2LongOpenHashMap();
     private final LongOpenHashSet  availableRows = new LongOpenHashSet();
-    private long  nextRow;
+    private long  resultSize;
 
     // endregion
 
@@ -112,24 +105,27 @@ public class PriceBook {
 
     private PriceBook(@NotNull final Table table,
                       @NotNull String idColumnName,
+                      @NotNull String prevIdColumnName,
                       @NotNull String symColumnName,
                       @NotNull String timestampColumnName,
                       @NotNull String priceColumnName,
                       @NotNull String sizeColumnName,
+                      @NotNull String execSizeColumnName,
                       @NotNull String sideColumnName,
                       @NotNull String opColumnName) {
         final QueryTable source = (QueryTable) table.coalesce();
         this.sourceIsBlink = BlinkTableTools.isBlink(source);
         this.orderMap.defaultReturnValue(-1);
-        this.nextRow = 0;
+        this.resultSize = 0;
 
         // Begin by getting references to the column sources from the input table to process later.
-        // Order ids will be the keys
         this.ordIdSource = source.getColumnSource(idColumnName);
+        this.prevOrderIdSource = source.getColumnSource(prevIdColumnName);
         this.symSource = source.getColumnSource(symColumnName);
-        this.timeSource = ReinterpretUtils.instantToLongSource(source.getColumnSource(timestampColumnName));
+        this.orderTimeSource = ReinterpretUtils.instantToLongSource(source.getColumnSource(timestampColumnName));
         this.priceSource = source.getColumnSource(priceColumnName);
         this.sizeSource = source.getColumnSource(sizeColumnName);
+        this.execSizeSource = source.getColumnSource(execSizeColumnName);
         this.sideSource = source.getColumnSource(sideColumnName);
         this.opSource = source.getColumnSource(opColumnName);
 
@@ -138,20 +134,20 @@ public class PriceBook {
 
         // Now we create the columns which will be in the output table.
         // Column for the update time
-        updateTimeResult = new InstantArraySource();
-        columnSourceMap.put("UpdateTimestamp", updateTimeResult);
+        updateTimeResults = new InstantArraySource();
+        columnSourceMap.put(UPDATE_TIME_NAME, updateTimeResults);
 
         // Set output table columns
         ordIdResults = new LongArraySource();
         symResults = new ObjectArraySource(String.class);
-        timeResults = new InstantArraySource();
+        orderTimeResults = new InstantArraySource();
         priceResults = new DoubleArraySource();
         sizeResults = new IntegerArraySource();
         sideResults = new IntegerArraySource();
 
         columnSourceMap.put(ORDID_NAME, ordIdResults);
         columnSourceMap.put(SYM_NAME, symResults);
-        columnSourceMap.put(TIME_NAME, timeResults);
+        columnSourceMap.put(ORD_TIME_NAME, orderTimeResults);
         columnSourceMap.put(PRC_NAME, priceResults);
         columnSourceMap.put(SIZE_NAME, sizeResults);
         columnSourceMap.put(SIDE_NAME, sideResults);
@@ -169,20 +165,20 @@ public class PriceBook {
                     // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
                     // the LTM thread and so it must know if it should use previous values or current values.
 
-                    // TODO: so processAdded now returns a ctx, which will contain the 3 rowsets. Is that ok? Will that
-                    //  mess with the 'try'-with-resources statement?
-                    final Context initCtx = processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev);
+                    TableUpdateImpl resultUpdate = new TableUpdateImpl();
+                    processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev, resultUpdate);
 
+                    WritableRowSet resultRows = (WritableRowSet) resultUpdate.added;
+                    resultRows.remove(resultUpdate.removed);
 
-                    final QueryTable bookTable = new QueryTable( (initCtx.rowsAdded.build()).toTracking(), columnSourceMap);
+                    // Is this any better?
+                    // ((WritableRowSet) resultUpdate.added).remove(resultUpdate.removed);
+
+                    final QueryTable bookTable = new QueryTable( (resultRows).toTracking(), columnSourceMap);
 
                     if (snapshotControl != null) {
                         columnSourceMap.values().forEach(ColumnSource::startTrackingPrevValues);
                         bookTable.setRefreshing(true);
-
-                        // TODO: The output resultsTable, should NOT be a blink table, right? because now I'm removing
-                        //  and modifying things...?
-                        bookTable.setAttribute(Table.BLINK_TABLE_ATTRIBUTE, true);
                         bookTable.getRowSet().writableCast().initializePreviousValue();
 
                         // To Produce a blink table we need to be able to respond to upstream changes when they exist
@@ -219,10 +215,12 @@ public class PriceBook {
      *
      * @param added the index of added rows from the source
      * @param usePrev if previous values should be used
-     * @return the Context used for processing
+     * @param resultUpdate the update object that will be used in the listener to push out the added, removed,
+     *                     and modified RowSets
+     *
      */
     @SuppressWarnings("unchecked")
-    private Context processAdded(RowSet added, boolean usePrev) {
+    private void processAdded(RowSet added, boolean usePrev, TableUpdateImpl resultUpdate) {
         // First create the context object in a try-with-resources so it gets automatically cleaned up when we're done.
         try(final Context ctx = new Context()) {
             // Next we get an iterator into the added index so that we can process the update in chunks.
@@ -231,10 +229,12 @@ public class PriceBook {
             // In order to copy data into the writable chunks in the context we need to create
             // a fill context for each column we'll be copying
             final ChunkSource.FillContext oidfc = ctx.makeFillContext(ordIdSource);
+            final ChunkSource.FillContext poidfc = ctx.makeFillContext(prevOrderIdSource);
             final ChunkSource.FillContext symfc = ctx.makeFillContext(symSource);
-            final ChunkSource.FillContext timefc = ctx.makeFillContext(timeSource);
+            final ChunkSource.FillContext timefc = ctx.makeFillContext(orderTimeSource);
             final ChunkSource.FillContext pricefc = ctx.makeFillContext(priceSource);
             final ChunkSource.FillContext sizefc = ctx.makeFillContext(sizeSource);
+            final ChunkSource.FillContext esizefc = ctx.makeFillContext(execSizeSource);
             final ChunkSource.FillContext sidefc = ctx.makeFillContext(sideSource);
             final ChunkSource.FillContext opfc = ctx.makeFillContext(opSource);
 
@@ -249,86 +249,123 @@ public class PriceBook {
                 // Copy the row data from the column sources into our processing chunks, using previous values if requested
                 if(usePrev) {
                     ordIdSource.fillPrevChunk(oidfc, (WritableChunk<? super Values>) ctx.idChunk, nextKeys);
+                    prevOrderIdSource.fillPrevChunk(poidfc, (WritableChunk<? super Values>) ctx.prevIdChunk, nextKeys);
                     symSource.fillPrevChunk(symfc, (WritableChunk<? super Values>) ctx.symChunk, nextKeys);
-                    timeSource.fillPrevChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
+                    orderTimeSource.fillPrevChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
                     priceSource.fillPrevChunk(pricefc, (WritableChunk<? super Values>) ctx.priceChunk, nextKeys);
                     sizeSource.fillPrevChunk(sizefc, (WritableChunk<? super Values>) ctx.sizeChunk, nextKeys);
+                    execSizeSource.fillPrevChunk(esizefc, (WritableChunk<? super Values>) ctx.execSizeChunk, nextKeys);
                     sideSource.fillPrevChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
                     opSource.fillPrevChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
 
                 } else {
                     ordIdSource.fillChunk(oidfc, (WritableChunk<? super Values>) ctx.idChunk, nextKeys);
+                    prevOrderIdSource.fillChunk(poidfc, (WritableChunk<? super Values>) ctx.prevIdChunk, nextKeys);
                     symSource.fillChunk(symfc, (WritableChunk<? super Values>) ctx.symChunk, nextKeys);
-                    timeSource.fillChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
+                    orderTimeSource.fillChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
                     priceSource.fillChunk(pricefc, (WritableChunk<? super Values>) ctx.priceChunk, nextKeys);
                     sizeSource.fillChunk(sizefc, (WritableChunk<? super Values>) ctx.sizeChunk, nextKeys);
+                    execSizeSource.fillChunk(esizefc, (WritableChunk<? super Values>) ctx.execSizeChunk, nextKeys);
                     sideSource.fillChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
                     opSource.fillChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
-
                 }
 
 
-                // TODO: Should I do the now() now, or right when I set the result in addOrder?
-                //  OR at the top of processAdded?
-                Instant timeNow = Instant.now();
+                final Instant timeNow = Instant.now();
 
                 // Iterate over each row in the processing chunk,  and update the book.
                 for(int ii = 0; ii< nextKeys.size(); ii++) {
-
-                    // Now grab each of the relevant values from the row and push them through the book to update.
+                    // Get some minimal data
                     final long ordId = ctx.idChunk.get(ii);
-                    final String sym = ctx.symChunk.get(ii);
-                    final long timestamp = ctx.timeChunk.get(ii);
-                    final double price = ctx.priceChunk.get(ii);
-                    final int size = ctx.sizeChunk.get(ii);
-                    final int side = ctx.sideChunk.get(ii);
                     final int op = ctx.opChunk.get(ii);
+                    final int size = ctx.sizeChunk.get(ii);
 
-                    // Update the internal state AND the result table
-                    this.update(ctx, ordId, sym, timestamp, price, size, side, op, timeNow);
+
+                    /* Order book building logic
+                     *
+                     * Order Ack (OAK): Add order to book
+                     * Order Cancel (CC): remove order from book
+                     * Cancel-Replace (CRACK): Remove the order PREV_ORD_ID. Ack the new ORD_ID.
+                     *                         If PREV_ORD_ID is 0, replace the size of ORD_ID
+                     * Internal-Fill (INF): Subtract size from current order size
+                     * Away-Fill (AWF): ??
+                     *
+                    */
+                    switch (op) {
+                        case OP_OAK -> {
+                            final long existingOrderRow = orderMap.get(ordId);
+
+                            // If the order doesn't already exist, add it
+                            // TODO: Do we care if we try to ack an order already ack'd? Should we complain?
+                            if (existingOrderRow == -1) {
+                                // Get rest of order data
+                                final String sym = ctx.symChunk.get(ii);
+                                final long timestamp = ctx.timeChunk.get(ii);
+                                final double price = ctx.priceChunk.get(ii);
+                                final int side = ctx.sideChunk.get(ii);
+
+                                this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
+
+                            } else {
+                                System.out.println(ordId + " already exists, can't add order.");
+                            }
+                        }
+
+                        case OP_CC -> this.removeOrder(ctx, ordId);
+
+                        case OP_INF -> {
+                            final long existingOrderRow = orderMap.get(ordId);
+                            final int execSize = ctx.execSizeChunk.get(ii);
+                            if (existingOrderRow != -1) {
+                                this.modifyOrder(ctx, execSize, existingOrderRow, false);
+                            } else {
+                                System.out.println(ordId + " doesn't not exist, can't modify order.");
+                            }
+                        }
+
+                        // Remove the prevOrderId if there is one and add the orderId.
+                        // If there is no prevOrderId, update the orderId with new size
+                        case OP_CRAK -> {
+                            final long prevOrderId = ctx.prevIdChunk.get(ii);
+                            final long existingOrderRow = orderMap.get(ordId);
+
+                            // We will replace the old order with a new one
+                            if ( prevOrderId != 0) {
+                                this.removeOrder(ctx, prevOrderId);
+
+                                if (existingOrderRow == -1) {
+                                    final String sym = ctx.symChunk.get(ii);
+                                    final long timestamp = ctx.timeChunk.get(ii);
+                                    final double price = ctx.priceChunk.get(ii);
+                                    final int side = ctx.sideChunk.get(ii);
+
+                                    this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
+                                } else {
+                                    System.out.println(ordId + " already exists, can't add order.");
+                                }
+
+                            } else {
+                                // Just update the same order (replace or subtract?)
+                                if (existingOrderRow != -1) {
+                                    final int execSize = ctx.execSizeChunk.get(ii);
+                                    this.modifyOrder(ctx, execSize, existingOrderRow, true);
+                                } else {
+                                    System.out.println(ordId + " doesn't not exist, can't modify order.");
+                                }
+
+                            }
+                        }
+                    }
+
                 }
             }
 
-            // Just return the whole ctx and get added/removed/modified from there
-            return ctx;
+            resultUpdate.added = ctx.rowsAdded.build();
+            resultUpdate.removed = ctx.rowsRemoved.build();
+            resultUpdate.modified = ctx.rowsModified.build();
         }
     }
 
-
-    /**
-     * Update the book state with the specified order + operation.
-     * If the book op was DELETE or REMOVE, or the size was 0, the order will be removed from the book.
-     *
-     *
-     * @param time the time of the price
-     * @param price the price
-     * @param size the size of the order
-     * @param side the side of the order
-     * @param orderId the id of the order
-     * @param op the book op
-     * @return true if the price resulted in a book update
-     */
-    public void update(final Context ctx,
-                          final long orderId,
-                          final String sym,
-                          final long time,
-                          final double price,
-                          final int size,
-                          final int side,
-                          final int op,
-                          final Instant timeNow) {
-
-        // Will add fill, update, etc op logic here
-
-        // Remove this price from the book entirely.
-        // TODO: I'm not sure about size=0, might be subject to personal preference?
-        if(op == OP_REMOVE || size == 0) {
-            this.removeFrom(ctx, orderId);
-        }
-
-        // TODO: Is it bad that I'm just passing all these input parameters through multiple functions?
-        this.addOrder(ctx, orderId, sym, time, price, size, side, timeNow);
-    }
 
     /**
      * Update the specified order in the book.  If the order was new add it to the bookstate.
@@ -351,12 +388,6 @@ public class PriceBook {
                           int side,
                           Instant timeNow) {
         long rowOfAdded;
-        long newSize;
-
-        // We tried to add an order we already have.
-        if (orderMap.containsKey(orderId)) {
-            return;
-        }
 
         // Find an open slot or increment the row counter
         if (!availableRows.isEmpty()) {
@@ -364,46 +395,41 @@ public class PriceBook {
             availableRows.remove(rowOfAdded);  // Remove it from the set
 
         } else {
-            rowOfAdded = nextRow;
-            nextRow++;
+            // No open spots, so expand the size of the columns
+            rowOfAdded = resultSize;
+            resultSize++;
+
+            ordIdResults.ensureCapacity(resultSize);
+            symResults.ensureCapacity(resultSize);
+            orderTimeResults.ensureCapacity(resultSize);
+            priceResults.ensureCapacity(resultSize);
+            sizeResults.ensureCapacity(resultSize);
+            sideResults.ensureCapacity(resultSize);
+            updateTimeResults.ensureCapacity(resultSize);
         }
 
         //Add map from id to row num
         orderMap.put(orderId, rowOfAdded);
         ctx.rowsAdded.addKey(rowOfAdded);
+//        ctx.rowsRemoved.removeKey(rowOfAdded);
 
-        // Add to results
-        newSize = rowOfAdded + 1;
-
-        ordIdResults.ensureCapacity(newSize);
         ordIdResults.set(rowOfAdded, orderId);
-
-        symResults.ensureCapacity(newSize);
         symResults.set(rowOfAdded, sym);
-
-        timeResults.ensureCapacity(newSize);
-        timeResults.set(rowOfAdded, time);
-
-        priceResults.ensureCapacity(newSize);
+        orderTimeResults.set(rowOfAdded, time);
         priceResults.set(rowOfAdded, price);
-
-        sizeResults.ensureCapacity(newSize);
         sizeResults.set(rowOfAdded, size);
-
-        sideResults.ensureCapacity(newSize);
         sideResults.set(rowOfAdded, side);
-
-        updateTimeResult.ensureCapacity(newSize);
-        updateTimeResult.set(rowOfAdded, timeNow);
+        updateTimeResults.set(rowOfAdded, timeNow);
     }
 
     /**
      * Remove the specified orderId from the book.
      *
+     * @param ctx the context of the update cycle to update
      * @param orderId the order to remove
      *
      */
-    private void removeFrom(Context ctx, long orderId) {
+    private void removeOrder(Context ctx, long orderId) {
         final long rowOfRemoved;
 
         rowOfRemoved = orderMap.remove(orderId);
@@ -411,18 +437,32 @@ public class PriceBook {
         if (rowOfRemoved != -1){
             availableRows.add(rowOfRemoved);
             ctx.rowsRemoved.addKey(rowOfRemoved);
+        } else {
+            System.out.println(orderId + " doesn't exists, can't remove order.");
         }
     }
 
     /**
-     * Check if the specified orderId is in the book.
+     * Modify the order at orderRow
      *
-     * @param orderId the price
-     * @return true if it is in the top N prices.
+     * @param ctx the context of the update cycle to update
+     * @param size the order to subtract from the current size
+     * @param orderRow the row key to be modified
+     *
      */
-    public boolean isOrderInBook(long orderId) {
-        return orderMap.containsKey(orderId);
+    private void modifyOrder(Context ctx, int size, long orderRow, boolean replace) {
+
+        if (replace) {
+            sizeResults.set(orderRow, size);
+
+        } else {
+            int currSize = sizeResults.get(orderRow);
+            sizeResults.set(orderRow, currSize - size);
+        }
+
+        ctx.rowsModified.addKey(orderRow);
     }
+
 
     /**
      * This class holds various objects that are used during an update cycle.  This includes chunks for holding and processing
@@ -434,10 +474,12 @@ public class PriceBook {
          * instead of iterating over an index.  This avoids virtual method calls and is much more cache-friendly
          */
         final WritableLongChunk<?> idChunk;
+        final WritableLongChunk<?> prevIdChunk;
         final WritableObjectChunk<String, ?> symChunk;
         final WritableLongChunk<?> timeChunk;
         final WritableDoubleChunk<?> priceChunk;
         final WritableIntChunk<?> sizeChunk;
+        final WritableIntChunk<?> execSizeChunk;
         final WritableIntChunk<?> sideChunk;
         final WritableIntChunk<?> opChunk;
 
@@ -448,8 +490,7 @@ public class PriceBook {
         final SharedContext sc;
         final List<ChunkSource.FillContext> fillContexts = new ArrayList<>(6);
 
-
-        // rowsAdded keeps track of how many update rows were emitted so that the result index can be updated and a downstream
+        // Keep track of rows added, removed, or modified so that the result index can be updated and a downstream
         // update can be fired to anything listening to the result table.
         RowSetBuilderRandom rowsAdded = RowSetFactory.builderRandom();
         RowSetBuilderRandom rowsRemoved = RowSetFactory.builderRandom();
@@ -459,10 +500,12 @@ public class PriceBook {
             sc = SharedContext.makeSharedContext();
 
             idChunk   = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            prevIdChunk   = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
             symChunk   = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
             timeChunk  = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
             priceChunk = WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
             sizeChunk  = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+            execSizeChunk  = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
             sideChunk  = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
             opChunk    = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
         }
@@ -476,10 +519,12 @@ public class PriceBook {
             sc.close();
             fillContexts.forEach(ChunkSource.FillContext::close);
             idChunk.close();
+            prevIdChunk.close();
             symChunk.close();
             timeChunk.close();
             priceChunk.close();
             sizeChunk.close();
+            execSizeChunk.close();
             sideChunk.close();
             opChunk.close();
         }
@@ -545,9 +590,8 @@ public class PriceBook {
          */
         @Override
         public void process() {
-            final RowSet addedIndex;
-            final RowSet removedIndex;
-            final RowSet modifiedIndex;
+            TableUpdateImpl resultUpdate = new TableUpdateImpl();
+
             // If the upstream listener has not fired (for example, if there were no upstream changes)
             // then do not try to process the updates -- there are none, we just need to blink the existing rows
             // out.
@@ -560,34 +604,28 @@ public class PriceBook {
                 }
 
                 // First process all of the new rows
-                final Context ctx = processAdded(upstream.added(), false);
+                processAdded(upstream.added(), false, resultUpdate);
 
                 // Handle the case where the input rows generate no book state changes,  we don't want to accidentally
                 // try to inject a -1 into the row set.
-                addedIndex = ctx.rowsAdded.build();
-                removedIndex = ctx.rowsRemoved.build();
-                modifiedIndex = ctx.rowsModified.build();
 
             } else {
-                addedIndex = RowSetFactory.empty();
-                removedIndex = RowSetFactory.empty();
-                modifiedIndex = RowSetFactory.empty();
+                resultUpdate.added = RowSetFactory.empty();
+                resultUpdate.removed = RowSetFactory.empty();
+                resultUpdate.modified = RowSetFactory.empty();
             }
 
+            resultUpdate.shifted = RowSetShiftData.EMPTY;
+            resultUpdate.modifiedColumnSet = ModifiedColumnSet.EMPTY;
             // Once the rows have been processed then we create update the result index with the new rows and fire an
             // update for any downstream listeners of the result table.
-            resultIndex.update(addedIndex, removedIndex);
-            resultTable.notifyListeners(new TableUpdateImpl(addedIndex,
-                    removedIndex,
-                    modifiedIndex,
-                    RowSetShiftData.EMPTY,
-                    ModifiedColumnSet.EMPTY));
+            resultIndex.update(resultUpdate.added, resultUpdate.removed);
+            resultTable.notifyListeners(resultUpdate);
         }
     }
 
     /**
-     * Build a book of bid and ask prices with the specified number of levels from the requested table, grouping input rows by the
-     * specified set of grouping columns.  Levels will be represented as a set of columns (Price, Time, Size) for each level.
+     * Build a book of current live orders and their status
      *
      * @param source the table with the source data
      * @param idColumnName the name of the source order id column
@@ -603,21 +641,25 @@ public class PriceBook {
     @SuppressWarnings("unused")
     public static QueryTable build(@NotNull Table source,
                                    @NotNull String idColumnName,
+                                   @NotNull String prevIdColumnName,
                                    @NotNull String symColumnName,
                                    @NotNull String timestampColumnName,
                                    @NotNull String priceColumnName,
                                    @NotNull String sizeColumnName,
+                                   @NotNull String execSizeColumnName,
                                    @NotNull String sideColumnName,
                                    @NotNull String opColumnName
                                    ) {
         final PriceBook book = new PriceBook(source,
-                timestampColumnName,
-                sizeColumnName,
-                sideColumnName,
-                opColumnName,
-                priceColumnName,
+                idColumnName,
+                prevIdColumnName,
                 symColumnName,
-                idColumnName);
+                timestampColumnName,
+                priceColumnName,
+                sizeColumnName,
+                execSizeColumnName,
+                sideColumnName,
+                opColumnName);
 
         return book.resultTable;
     }
