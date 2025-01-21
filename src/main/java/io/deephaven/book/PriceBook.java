@@ -1,30 +1,33 @@
 package io.deephaven.book;
 
-
-import com.google.common.collect.MinMaxPriorityQueue;
+import java.lang.String;
+import java.time.Instant;
 import io.deephaven.chunk.*;
 import io.deephaven.chunk.attributes.Values;
 import io.deephaven.engine.rowset.*;
 import io.deephaven.engine.table.*;
 import io.deephaven.engine.table.impl.*;
-import io.deephaven.engine.table.impl.sources.ArrayBackedColumnSource;
 import io.deephaven.engine.table.impl.sources.DoubleArraySource;
 import io.deephaven.engine.table.impl.sources.InstantArraySource;
 import io.deephaven.engine.table.impl.sources.IntegerArraySource;
+import io.deephaven.engine.table.impl.sources.ObjectArraySource;
+import io.deephaven.engine.table.impl.sources.LongArraySource;
 import io.deephaven.util.SafeCloseable;
-import it.unimi.dsi.fastutil.doubles.Double2IntOpenHashMap;
-import it.unimi.dsi.fastutil.doubles.Double2LongOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+
 import org.jetbrains.annotations.NotNull;
+import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
 
 import java.util.*;
 
 import static io.deephaven.util.QueryConstants.*;
 
 /**
- * <p>Build a book of the top N Bid/Ask prices in a columnar book format.</p>
+ * <p>Build a book of current live orders</p>
  * <p>
- *     Creating a price book is as simple as invoking the static build method, specifying the columns to group on
- *     and the desired depth-of-book.
+ *     Creating a price book is as simple as invoking the static build method, specifying the column names of
+ *     your source table.
  *
  *      <pre>{@code
  *      import io.deephaven.book.PriceBook
@@ -33,45 +36,45 @@ import static io.deephaven.util.QueryConstants.*;
  *                      .where("Date=`2021-01-13`", "Time > '2021-01-13T08:30:00 NY'")
  *                      .sort("Time")
  *
- *      // Construct a book of depth 8, grouping prices by their Symbol
- *      // This will use the default columns "Time", "ORIG_SIZE", "BUY_SELL_FLAG", "BOOK_OP", "PRICE"
- *      book = PriceBook.build(orderStream, 8, "Symbol")
+ *      book = PriceBook.build(orderStream,"ORD_ID", "PREV_ORD_ID", "SYMB", "EPOCH_TS",  "PRC",
+ *                "QTY", "EXEC_QTY", "SIDE", "EVT_ID")
+ *
  *      }</pre>
  *
- * <p>
- *     By default, the PriceBook will group input rows that have identical timestamps into a single emitted output row.
- *     If this is not the desired behavior, or you require more fine grained control of the columns used to build the book
- *     you may use the more specific builder method
- *     {@link #build(Table, int, boolean, String, String, String, String, String, String...)}
- * </p>
  * <p></p>
  * <p>
- *      The following example creates a book of depth 5, that does NOT group identical timestamps, and groups input rows by "Symbol" and "Exchange"
- *      <pre>{@code
- *      book = PriceBook.build(orderStream, 5, false, "Timestamp", "OrderSize", "OrderSize", "BookOp", "Price", "Symbol", "Exchange")
- *      }</pre>
  *
  */
 public class PriceBook {
     private static final int CHUNK_SIZE = 2048;
-    private static final int SIDE_BUY = 0;
-    private static final int SIDE_SELL = 1;
+    private static final int SIDE_BUY = 1;
+    private static final int SIDE_SELL = 2;
 
-    private static final int OP_INSERT = 1;
-    private static final int OP_REMOVE = 2;
+    private static final int OP_OAK = 1;
+    private static final int OP_CC = 2;
+    private static final int OP_INF = 3;
+    private static final int OP_CRAK = 4;
 
-    private final Map<Object, BookState> states = new HashMap<>();
-    private final boolean batchTimestamps;
-    private final int depth;
+    // Names of the output table columns
+    private static final String UPDATE_TIME_NAME = "UpdateTimestamp";
+    private static final String ORDID_NAME = "OrderId";
+    private static final String SYM_NAME = "Symbol";
+    private static final String ORD_TIME_NAME = "OrderTimestamp";
+    private static final String PRC_NAME = "Price";
+    private static final String SIZE_NAME = "Size";
+    private static final String SIDE_NAME = "Side";
+
 
     // region Input Sources
-    private final ColumnSource<Long> timeSource;
+    private final ColumnSource<Long> ordIdSource;
+    private final ColumnSource<Long> prevOrderIdSource;
+    private final ColumnSource<Long> orderTimeSource;
     private final ColumnSource<Double> priceSource;
     private final ColumnSource<Integer> sizeSource;
+    private final ColumnSource<Integer> execSizeSource;
     private final ColumnSource<Integer> sideSource;
     private final ColumnSource<Integer> opSource;
-
-    private final TupleSource keySource;
+    private final ColumnSource<String> symSource;
     // endregion
 
     // region OutputSources
@@ -80,78 +83,71 @@ public class PriceBook {
 
     final TrackingWritableRowSet resultIndex;
 
-    final WritableColumnSource[] keyOutputSources;
-    final InstantArraySource timeResult;
-    final DoubleArraySource[] priceResults;
-    final InstantArraySource[] timeResults;
-    final IntegerArraySource[] sizeResults;
+    final InstantArraySource updateTimeResults;
+    final DoubleArraySource priceResults;
+    final InstantArraySource orderTimeResults;
+    final IntegerArraySource sizeResults;
+    final IntegerArraySource sideResults;
+    final LongArraySource ordIdResults;
+    final ObjectArraySource<String> symResults;
+    // endregion
 
+    // region Book state objects
+    private final Long2LongOpenHashMap orderMap = new Long2LongOpenHashMap();
+    private final LongOpenHashSet  availableRows = new LongOpenHashSet();
+    private long  resultSize;
     // endregion
 
     private final boolean sourceIsBlink;
 
     private PriceBook(@NotNull final Table table,
-                      final int depth,
-                      final boolean batchTimestamps,
+                      @NotNull String idColumnName,
+                      @NotNull String prevIdColumnName,
+                      @NotNull String symColumnName,
                       @NotNull String timestampColumnName,
-                      @NotNull String sizeColumnName,
-                      @NotNull String sideColumnName,
-                      @NotNull String opColumnName,
                       @NotNull String priceColumnName,
-                      @NotNull String... groupingCols) {
+                      @NotNull String sizeColumnName,
+                      @NotNull String execSizeColumnName,
+                      @NotNull String sideColumnName,
+                      @NotNull String opColumnName) {
         final QueryTable source = (QueryTable) table.coalesce();
-        this.batchTimestamps = batchTimestamps;
-        this.depth = depth;
         this.sourceIsBlink = BlinkTableTools.isBlink(source);
+        this.orderMap.defaultReturnValue(-1);
+        this.resultSize = 0;
 
         // Begin by getting references to the column sources from the input table to process later.
-        this.timeSource = source.getColumnSource(timestampColumnName).reinterpret(long.class);
-        this.priceSource = source.getColumnSource(priceColumnName);
-        this.sizeSource = source.getColumnSource(sizeColumnName);
-        this.sideSource = source.getColumnSource(sideColumnName);
-        this.opSource = source.getColumnSource(opColumnName);
-
-        // Since we may group by more than one column (say Symbol, Exchange) we want to create a single key object to look into
-        // the book state map.  Packing the key sources into a tuple does this neatly.
-        this.keySource = TupleSourceFactory.makeTupleSource(Arrays.stream(groupingCols).map(source::getColumnSource).toArray(ColumnSource[]::new));
+        this.ordIdSource        = source.getColumnSource(idColumnName);
+        this.prevOrderIdSource  = source.getColumnSource(prevIdColumnName);
+        this.symSource          = source.getColumnSource(symColumnName);
+        this.orderTimeSource    = ReinterpretUtils.instantToLongSource(source.getColumnSource(timestampColumnName));
+        this.priceSource        = source.getColumnSource(priceColumnName);
+        this.sizeSource         = source.getColumnSource(sizeColumnName);
+        this.execSizeSource     = source.getColumnSource(execSizeColumnName);
+        this.sideSource         = source.getColumnSource(sideColumnName);
+        this.opSource           = source.getColumnSource(opColumnName);
 
         // Construct the new column sources and result table.
         final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
 
-        // Now we create the columns which will be in the output table
-        timeResult = new InstantArraySource();
-        columnSourceMap.put("Timestamp", timeResult);
+        // Now we create the columns which will be in the output table.
+        // Column for the update time
+        updateTimeResults = new InstantArraySource();
+        columnSourceMap.put(UPDATE_TIME_NAME, updateTimeResults);
 
-        keyOutputSources = new WritableColumnSource[groupingCols.length];
-        for(int ii = 0; ii < groupingCols.length; ii++) {
-            final String groupingColName = groupingCols[ii];
-            final ColumnSource<?> gsCol = source.getColumnSource(groupingColName);
-            keyOutputSources[ii] = ArrayBackedColumnSource.getMemoryColumnSource(gsCol.getType(), gsCol.getComponentType());
-            columnSourceMap.put(groupingColName, keyOutputSources[ii]);
-        }
+        // Set output table columns
+        ordIdResults        = new LongArraySource();
+        symResults          = new ObjectArraySource(String.class);
+        orderTimeResults    = new InstantArraySource();
+        priceResults        = new DoubleArraySource();
+        sizeResults         = new IntegerArraySource();
+        sideResults         = new IntegerArraySource();
 
-        // The number of Price/Timestamp/Size columns is twice the requested book depth,  one set for
-        // bids, and one set for asks.
-        priceResults = new DoubleArraySource[2 * depth];
-        timeResults = new InstantArraySource[2 * depth];
-        sizeResults = new IntegerArraySource[2 * depth];
-
-        // Create each one iteratively, generate the name, and stuff them into the result column source map.
-        for(int ii = 0; ii < 2 * depth; ii++) {
-            final String prefix = ii < depth ? "Bid" : "Ask";
-            final String suffix = Integer.toString((ii % depth) + 1);
-            final InstantArraySource ts = new InstantArraySource();
-            timeResults[ii] = ts;
-            columnSourceMap.put(prefix+"_Timestamp"+ suffix, ts);
-
-            final DoubleArraySource ps = new DoubleArraySource();
-            priceResults[ii] = ps;
-            columnSourceMap.put(prefix+"_Price"+suffix, ps);
-
-            final IntegerArraySource ss = new IntegerArraySource();
-            sizeResults[ii] = ss;
-            columnSourceMap.put(prefix+"_Size"+suffix, ss);
-        }
+        columnSourceMap.put(ORDID_NAME, ordIdResults);
+        columnSourceMap.put(SYM_NAME, symResults);
+        columnSourceMap.put(ORD_TIME_NAME, orderTimeResults);
+        columnSourceMap.put(PRC_NAME, priceResults);
+        columnSourceMap.put(SIZE_NAME, sizeResults);
+        columnSourceMap.put(SIDE_NAME, sideResults);
 
         // Finally, create the result table for the user
         final OperationSnapshotControl snapshotControl =
@@ -165,15 +161,18 @@ public class PriceBook {
 
                     // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
                     // the LTM thread and so it must know if it should use previous values or current values.
-                    final long rowsAdded = processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev);
 
-                    final QueryTable bookTable = new QueryTable(
-                            (rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1)).toTracking()
-                            , columnSourceMap);
+                    TableUpdateImpl resultUpdate = new TableUpdateImpl();
+                    processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev, resultUpdate);
+
+                    WritableRowSet resultRows = (WritableRowSet) resultUpdate.added;
+                    resultRows.remove(resultUpdate.removed);
+
+                    final QueryTable bookTable = new QueryTable( (resultRows).toTracking(), columnSourceMap);
+
                     if (snapshotControl != null) {
                         columnSourceMap.values().forEach(ColumnSource::startTrackingPrevValues);
                         bookTable.setRefreshing(true);
-                        bookTable.setAttribute(Table.BLINK_TABLE_ATTRIBUTE, true);
                         bookTable.getRowSet().writableCast().initializePreviousValue();
 
                         // To Produce a blink table we need to be able to respond to upstream changes when they exist
@@ -210,324 +209,258 @@ public class PriceBook {
      *
      * @param added the index of added rows from the source
      * @param usePrev if previous values should be used
-     * @return the number of new rows emitted to the result.
+     * @param resultUpdate the update object that will be used in the listener to push out the added, removed,
+     *                     and modified RowSets
+     *
      */
     @SuppressWarnings("unchecked")
-    private long processAdded(RowSet added, boolean usePrev) {
+    private void processAdded(RowSet added, boolean usePrev, TableUpdateImpl resultUpdate) {
         // First create the context object in a try-with-resources so it gets automatically cleaned up when we're done.
-        try(final Context ctx = new Context(depth)) {
+        try(final Context ctx = new Context()) {
             // Next we get an iterator into the added index so that we can process the update in chunks.
             final RowSequence.Iterator okit = added.getRowSequenceIterator();
 
             // In order to copy data into the writable chunks in the context we need to create
-            // a fill context for each column we'll be copying/
-            final ChunkSource.FillContext timefc = ctx.makeFillContext(timeSource);
-            final ChunkSource.FillContext pricefc = ctx.makeFillContext(priceSource);
-            final ChunkSource.FillContext sizefc = ctx.makeFillContext(sizeSource);
-            final ChunkSource.FillContext sidefc = ctx.makeFillContext(sideSource);
-            final ChunkSource.FillContext opfc = ctx.makeFillContext(opSource);
-            final ChunkSource.FillContext keyfc = ctx.makeFillContext(keySource);
+            // a fill context for each column we'll be copying
+            final ChunkSource.FillContext oidfc     = ctx.makeFillContext(ordIdSource);
+            final ChunkSource.FillContext poidfc    = ctx.makeFillContext(prevOrderIdSource);
+            final ChunkSource.FillContext symfc     = ctx.makeFillContext(symSource);
+            final ChunkSource.FillContext timefc    = ctx.makeFillContext(orderTimeSource);
+            final ChunkSource.FillContext pricefc   = ctx.makeFillContext(priceSource);
+            final ChunkSource.FillContext sizefc    = ctx.makeFillContext(sizeSource);
+            final ChunkSource.FillContext esizefc   = ctx.makeFillContext(execSizeSource);
+            final ChunkSource.FillContext sidefc    = ctx.makeFillContext(sideSource);
+            final ChunkSource.FillContext opfc      = ctx.makeFillContext(opSource);
 
-            BookState currentState = null;
-            Object currentKey = null;
-            long lastTime = -1;
-            boolean batchUpdated = false;
 
             // Now process the entire added index in chunks of CHUNK_SIZE (2048) rows.
             while(okit.hasMore()) {
                 ctx.sc.reset();
 
-                // Grab up to the next CHUNK_SIZE rows
+                // Grab up to the next CHUNK_SIZE rows. nextKeys are row indices
                 final RowSequence nextKeys = okit.getNextRowSequenceWithLength(CHUNK_SIZE);
 
                 // Copy the row data from the column sources into our processing chunks, using previous values if requested
                 if(usePrev) {
-                    keySource.fillPrevChunk(keyfc, (WritableChunk<? super Values>) ctx.keyChunk, nextKeys);
-                    opSource.fillPrevChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
-                    sideSource.fillPrevChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
-                    sizeSource.fillPrevChunk(sizefc, (WritableChunk<? super Values>) ctx.sizeChunk, nextKeys);
+                    ordIdSource.fillPrevChunk(oidfc, (WritableChunk<? super Values>) ctx.idChunk, nextKeys);
+                    prevOrderIdSource.fillPrevChunk(poidfc, (WritableChunk<? super Values>) ctx.prevIdChunk, nextKeys);
+                    symSource.fillPrevChunk(symfc, (WritableChunk<? super Values>) ctx.symChunk, nextKeys);
+                    orderTimeSource.fillPrevChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
                     priceSource.fillPrevChunk(pricefc, (WritableChunk<? super Values>) ctx.priceChunk, nextKeys);
-                    timeSource.fillPrevChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
+                    sizeSource.fillPrevChunk(sizefc, (WritableChunk<? super Values>) ctx.sizeChunk, nextKeys);
+                    execSizeSource.fillPrevChunk(esizefc, (WritableChunk<? super Values>) ctx.execSizeChunk, nextKeys);
+                    sideSource.fillPrevChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
+                    opSource.fillPrevChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
+
                 } else {
-                    keySource.fillChunk(keyfc, (WritableChunk<? super Values>) ctx.keyChunk, nextKeys);
-                    opSource.fillChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
-                    sideSource.fillChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
-                    sizeSource.fillChunk(sizefc, (WritableChunk<? super Values>) ctx.sizeChunk, nextKeys);
+                    ordIdSource.fillChunk(oidfc, (WritableChunk<? super Values>) ctx.idChunk, nextKeys);
+                    prevOrderIdSource.fillChunk(poidfc, (WritableChunk<? super Values>) ctx.prevIdChunk, nextKeys);
+                    symSource.fillChunk(symfc, (WritableChunk<? super Values>) ctx.symChunk, nextKeys);
+                    orderTimeSource.fillChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
                     priceSource.fillChunk(pricefc, (WritableChunk<? super Values>) ctx.priceChunk, nextKeys);
-                    timeSource.fillChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
+                    sizeSource.fillChunk(sizefc, (WritableChunk<? super Values>) ctx.sizeChunk, nextKeys);
+                    execSizeSource.fillChunk(esizefc, (WritableChunk<? super Values>) ctx.execSizeChunk, nextKeys);
+                    sideSource.fillChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
+                    opSource.fillChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
                 }
 
-                // Iterate over each row in the processing chunk,  and update the appropriate book.
-                for(int ii = 0; ii< nextKeys.size(); ii++) {
-                    // First get the key that identifies which book this price belongs to
-                    final Object nextKey = ctx.keyChunk.get(ii);
 
-                    // Then fetch the book if it's different than the last key.  This lets us avoid a bunch of
-                    // hash lookups
-                    if(currentState == null || !Objects.equals(currentKey, nextKey)) {
-                        // Maybe record the last batch if we were batching.
-                        if(batchTimestamps && batchUpdated) {
-                            // If the book indicated there was an update, and the given price was one of the top N
-                            // bid or ask prices, we will emit a row to the output.
-                            recordChange(ctx, currentState, lastTime, currentKey);
-                            batchUpdated = false;
+                final Instant timeNow = Instant.now();
+
+                // Iterate over each row in the processing chunk,  and update the book.
+                for(int ii = 0; ii< nextKeys.size(); ii++) {
+                    // Get some minimal data
+                    final long ordId = ctx.idChunk.get(ii);
+                    final int op = ctx.opChunk.get(ii);
+                    final int size = ctx.sizeChunk.get(ii);
+
+
+                    /* Order book building logic
+                     *
+                     * Order Ack (OAK): Add order to book
+                     * Order Cancel (CC): remove order from book
+                     * Cancel-Replace (CRACK): Remove the order PREV_ORD_ID. Ack the new ORD_ID.
+                     *                         If PREV_ORD_ID is 0, replace the size of ORD_ID
+                     * Internal-Fill (INF): Subtract size from current order size
+                     * Away-Fill (AWF): ??
+                     *
+                    */
+                    switch (op) {
+                        case OP_OAK -> {
+                            final long existingOrderRow = orderMap.get(ordId);
+
+                            // If the order doesn't already exist, add it
+                            // TODO: Do we care if we try to ack an order already ack'd? Should we complain?
+                            if (existingOrderRow == -1) {
+                                // Get rest of order data
+                                final String sym = ctx.symChunk.get(ii);
+                                final long timestamp = ctx.timeChunk.get(ii);
+                                final double price = ctx.priceChunk.get(ii);
+                                final int side = ctx.sideChunk.get(ii);
+
+                                this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
+
+                            } else {
+                                System.out.println(ordId + " already exists, can't add order.");
+                            }
                         }
 
-                        // Try to avoid hash lookups..
-                        currentState = states.computeIfAbsent(nextKey, k -> new BookState(depth));
-                        currentKey = nextKey;
+                        case OP_CC -> this.removeOrder(ctx, ordId);
+
+                        case OP_INF -> {
+                            final long existingOrderRow = orderMap.get(ordId);
+                            final int execSize = ctx.execSizeChunk.get(ii);
+                            if (existingOrderRow != -1) {
+                                this.modifyOrder(ctx, execSize, existingOrderRow, false);
+                            } else {
+                                System.out.println(ordId + " does not exist, can't modify order.");
+                            }
+                        }
+
+                        // Remove the prevOrderId if there is one and add the orderId.
+                        // If there is no prevOrderId, update the orderId with new size
+                        case OP_CRAK -> {
+                            final long prevOrderId = ctx.prevIdChunk.get(ii);
+                            final long existingOrderRow = orderMap.get(ordId);
+
+                            // We will replace the old order with a new one
+                            if ( prevOrderId != 0) {
+                                this.removeOrder(ctx, prevOrderId);
+
+                                if (existingOrderRow == -1) {
+                                    final String sym = ctx.symChunk.get(ii);
+                                    final long timestamp = ctx.timeChunk.get(ii);
+                                    final double price = ctx.priceChunk.get(ii);
+                                    final int side = ctx.sideChunk.get(ii);
+
+                                    this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
+                                } else {
+                                    System.out.println(ordId + " already exists, can't add order.");
+                                }
+
+                            } else {
+                                if (existingOrderRow != -1) {
+                                    final int execSize = ctx.execSizeChunk.get(ii);
+                                    this.modifyOrder(ctx, execSize, existingOrderRow, true);
+                                } else {
+                                    System.out.println(ordId + " does not exist, can't modify order.");
+                                }
+
+                            }
+                        }
                     }
 
-                    // Now grab each of the relevant values from the row and push them through the book to update.
-                    final double price = ctx.priceChunk.get(ii);
-                    final int size = ctx.sizeChunk.get(ii);
-                    final int side = ctx.sideChunk.get(ii);
-                    final int op = ctx.opChunk.get(ii);
-                    final long timestamp = ctx.timeChunk.get(ii);
-
-                    batchUpdated |= currentState.update(timestamp, price, size, side, op);
-
-                    // We should only log a row if we are either not batching,  or the timestamp changed
-                    final boolean logRowGate = (!batchTimestamps || timestamp != lastTime);
-
-                    if(batchUpdated &&
-                            logRowGate &&
-                            ((side == SIDE_BUY  && currentState.bids.isPriceInBook(price)) ||
-                                    (side == SIDE_SELL && currentState.asks.isPriceInBook(price))   )) {
-                        // If the book indicated there was an update, and the given price was one of the top N
-                        // bid or ask prices, we will emit a row to the output.
-                        recordChange(ctx, currentState, timestamp, currentKey);
-                    }
-
-                    // If we logged a row reset the updated flag.
-                    if(logRowGate) {
-                        batchUpdated = false;
-                    }
-                    lastTime = timestamp;
                 }
             }
-
-            return ctx.rowsAdded;
+            resultUpdate.added = ctx.rowsAdded;
+            resultUpdate.removed = ctx.rowsRemoved;
+            resultUpdate.modified = ctx.rowsModified;
         }
     }
 
+
     /**
-     * Write out a single row of updates to the output table.
+     * Add the specified order to the book.  If the order was new add it to the bookstate.
      *
-     * @param ctx the context object
-     * @param state the book that was updated
-     * @param timestamp the timestamp of the change
-     * @param key the key being updated
-     */
-    public void recordChange(Context ctx, BookState state, long timestamp, Object key) {
-        // The next index to write to is the current size of the index plus however many rows we have added so far.
-        final long nextIndex = ctx.rowsAdded;
-        final long newSize = nextIndex + 1;
-
-        // Write the appropriate output values to each column source, first ensuring that each column is big enough
-        // to hold the next value.
-        timeResult.ensureCapacity(newSize);
-        timeResult.set(nextIndex, timestamp);
-
-        for(int ii = 0; ii < keyOutputSources.length; ii++) {
-            keyOutputSources[ii].ensureCapacity(newSize);
-            keyOutputSources[ii].set(nextIndex, keySource.exportElement(key, ii));
-        }
-
-        // Fill out the bid columns
-        fillFrom(0, depth, nextIndex, newSize, state.bids, ctx, Comparator.reverseOrder());
-
-        // Fill out the ask columns
-        fillFrom(depth, depth, nextIndex, newSize, state.asks, ctx, Comparator.naturalOrder());
-
-        // Increment the number of rows added.
-        ctx.rowsAdded++;
-    }
-
-    /**
-     * Fill out a set of timestamp/price/size columns in order.  These columns were created in order in the constructor
-     * for all bids, and then asks,  so we can just walk 'depth' times to write out the prices.
+     * @param ctx the context used to update the removed and added rowsets
+     * @param orderId the order id
+     * @param sym the symbol of the order
+     * @param time the timestamp of the order
+     * @param price the price of the order
+     * @param size the size of the order
+     * @param side the side of the order
+     * @param timeNow the time the order is updated in the book
      *
-     * @param start the starting index of best prices
-     * @param count the number of prices to write
-     * @param destination the destination row to write to in the output table
-     * @param newSize the new table size for ensureCapcity
-     * @param book the book to source data from
-     * @param ctx the shared context
-     * @param comparator the comparator for sorting the prices properly.
      */
-    private void fillFrom(int start, int count, long destination, long newSize, Book book, Context ctx, Comparator<? super Double> comparator) {
-        // First copy the best prices from the book into our temporary array and sort it appropriately
-        Arrays.sort(book.bestPrices.toArray(ctx.priceBuf), 0, book.bestPrices.size(), comparator);
+    private void addOrder(Context ctx,
+                          long orderId,
+                          String sym,
+                          long time,
+                          double price,
+                          int size,
+                          int side,
+                          Instant timeNow) {
+        long rowOfAdded;
 
-        // Then, once for each price level  write out the timestamp, size, and price of that particular order from the book.
-        for(int ii = start; ii < start + count; ii++) {
-            final double price;
-            final int size;
-            final long time;
+        // Find an open slot or increment the row counter
+        if (!availableRows.isEmpty()) {
+            rowOfAdded = availableRows.iterator().nextLong();  // Grab any element
+            availableRows.remove(rowOfAdded);  // Remove it from the set
 
-            // Select the values to be written.  Initially, the book may not be fully populated so we will
-            // use NULL values for each type for the remaining values.
-            if(ii - start < book.bestPrices.size()) {
-                price = ctx.priceBuf[ii-start];
-                time = book.timestampMap.get(price);
-                size = book.sizeMap.get(price);
-            } else {
-                price = NULL_DOUBLE;
-                time = NULL_LONG;
-                size = NULL_INT;
-            }
+            // If we are re-using a row index, we might have used it to remove in the same cycle
+            ctx.rowsRemoved.remove(rowOfAdded);
 
-            priceResults[ii].ensureCapacity(newSize);
-            priceResults[ii].set(destination, price);
+        } else {
+            // No open spots, so expand the size of the columns
+            rowOfAdded = resultSize;
+            resultSize++;
 
-            timeResults[ii].ensureCapacity(newSize);
-            timeResults[ii].set(destination, time);
-
-            sizeResults[ii].ensureCapacity(newSize);
-            sizeResults[ii].set(destination, size);
+            ordIdResults.ensureCapacity(resultSize);
+            symResults.ensureCapacity(resultSize);
+            orderTimeResults.ensureCapacity(resultSize);
+            priceResults.ensureCapacity(resultSize);
+            sizeResults.ensureCapacity(resultSize);
+            sideResults.ensureCapacity(resultSize);
+            updateTimeResults.ensureCapacity(resultSize);
         }
+
+        //Add map from id to row num
+        orderMap.put(orderId, rowOfAdded);
+        ctx.rowsAdded.insert(rowOfAdded);
+
+        ordIdResults.set(rowOfAdded, orderId);
+        symResults.set(rowOfAdded, sym);
+        orderTimeResults.set(rowOfAdded, time);
+        priceResults.set(rowOfAdded, price);
+        sizeResults.set(rowOfAdded, size);
+        sideResults.set(rowOfAdded, side);
+        updateTimeResults.set(rowOfAdded, timeNow);
     }
 
     /**
-     * A Book simply tracks a set of prices and sizes.  It uses two min/max priority queues.  One maintains the top
-     * N items,  the other maintains the backlog of prices.  Prices are added to the bestPrices queue until it is full,
-     * then as prices come in, if they belong in bestPrices then the last item is moved from the bestPrices to the backlog queue
-     * and the new item is inserted into the bestPrices queue.
+     * Remove the specified orderId from the book.
      *
-     * This class uses a comparator so that the same code can be used for Bids which need to be sorted descending, and asks
-     * which need to be sorted ascending.
+     * @param ctx the context of the update cycle to update
+     * @param orderId the order to remove
+     *
      */
-    private static class Book {
-        private final MinMaxPriorityQueue<Double> bestPrices;
-        private final PriorityQueue<Double> overflowPrices;
-        private final Double2IntOpenHashMap sizeMap = new Double2IntOpenHashMap();
-        private final Double2LongOpenHashMap timestampMap = new Double2LongOpenHashMap();
+    private void removeOrder(Context ctx, long orderId) {
+        final long rowOfRemoved;
 
-        private final long depth;
-        private final Comparator<Double> comparator;
+        rowOfRemoved = orderMap.remove(orderId);
 
-        Book(int depth, Comparator<Double> comparator) {
-            this.depth = depth;
-            this.comparator = comparator;
-            this.sizeMap.defaultReturnValue(-1);
-            this.timestampMap.defaultReturnValue(-1);
-            bestPrices = MinMaxPriorityQueue.orderedBy(comparator).maximumSize(depth).create();
-            overflowPrices = new PriorityQueue<>(comparator);
-        }
-
-        /**
-         * Update the specified price in the book.  If the price was new and larger than the any of the prices in the
-         * bestPrices queue, the last price in the bestPrices queue is moved to the backlog and the new price is inserted
-         * into the bestPrices, otherwise it is inserted directly into the backlog.
-         *
-         * @param price the price to update
-         * @param size the order size
-         * @param time the order time
-         * @return true of the price was added
-         */
-        private boolean updatePrice(double price, int size, long time) {
-            final long prevSize = sizeMap.put(price, size);
-            final long prevTime = timestampMap.put(price, time);
-
-            // It's a new price!
-            if(prevSize == sizeMap.defaultReturnValue()) {
-                if(bestPrices.size() < depth) {
-                    bestPrices.offer(price);
-                } else if(comparator.compare(price, bestPrices.peekLast()) < 0) {
-                    // Move the lowest value from the top10 to the overflow
-                    overflowPrices.offer(bestPrices.pollLast());
-
-                    // Push this price onto the top10
-                    bestPrices.offer(price);
-                } else {
-                    overflowPrices.offer(price);
-                }
-
-                return true;
-            }
-
-            return prevSize != size || prevTime != time;
-        }
-
-        /**
-         * Remove the specified price from the book.  If the price was one of the top N prices then the next
-         * price will be promoted from the backlog queue.
-         *
-         * @param price the price to remove
-         * @return true if anything was actually removed.
-         */
-        private boolean removeFrom(double price) {
-            final boolean wasRemoved;
-
-            if(comparator.compare(price, bestPrices.peekLast()) <= 0) {
-                // Remove the price
-                wasRemoved = bestPrices.remove(price);
-
-                // Promote one from the overflow
-                if(wasRemoved && !overflowPrices.isEmpty()) {
-                    bestPrices.offer(overflowPrices.poll());
-                }
-            } else {
-                wasRemoved = overflowPrices.remove(price);
-            }
-
-            sizeMap.remove(price);
-            timestampMap.remove(price);
-
-            return wasRemoved;
-        }
-
-        /**
-         * Check if the specified price is in the top N prices defined by the book depth.
-         *
-         * @param price the price
-         * @return true if it is in the top N prices.
-         */
-        public boolean isPriceInBook(double price) {
-            return bestPrices.size() < depth || comparator.compare(price, bestPrices.peekLast()) <= 0;
+        if (rowOfRemoved != -1){
+            availableRows.add(rowOfRemoved);
+            ctx.rowsRemoved.insert(rowOfRemoved);
+            ctx.rowsAdded.remove(rowOfRemoved);
+            ctx.rowsModified.remove(rowOfRemoved);
+        } else {
+            System.out.println(orderId + " does not exist, can't remove order.");
         }
     }
 
     /**
-     * A convenient state holder object that holds a bid and ask book.  Upon updates, this will decide if the update was
-     * an UPDATE, ADD, REMOVE, or DELETE, as well as which side of the order it was and update the proper book.
+     * Modify the order at orderRow
+     *
+     * @param ctx the context of the update cycle to update
+     * @param size the order to subtract from the current size
+     * @param orderRow the row key to be modified
+     * @param replace whether to replace or subtract the size from the original size
+     *
      */
-    private static class BookState {
-        final Book bids;
-        final Book asks;
+    private void modifyOrder(Context ctx, int size, long orderRow, boolean replace) {
 
-        BookState(int depth) {
-            bids = new Book(depth, Comparator.reverseOrder());
-            asks = new Book(depth, Comparator.naturalOrder());
+        if (replace) {
+            sizeResults.set(orderRow, size);
+
+        } else {
+            int currSize = sizeResults.get(orderRow);
+            sizeResults.set(orderRow, currSize - size);
         }
 
-        /**
-         * Update the book state with the specified price.  If the book op was DELETE or REMOVE, or the size was 0
-         * the price will be removed from the book.
-         *
-         * @param time the time of the price
-         * @param price the price
-         * @param size the size of the order
-         * @param side the side of the order
-         * @param op the book op
-         * @return true if the price resulted in a book update
-         */
-        public boolean update(final long time,
-                              final double price,
-                              final int size,
-                              final int side,
-                              final int op) {
-            final Book book = (side == SIDE_SELL) ? asks: bids;
-
-            // Remove this price from the book entirely.
-            if(op == OP_REMOVE || size == 0) {
-                return book.removeFrom(price);
-            }
-
-            return book.updatePrice(price, size, time);
-        }
+        ctx.rowsModified.insert(orderRow);
     }
+
 
     /**
      * This class holds various objects that are used during an update cycle.  This includes chunks for holding and processing
@@ -538,12 +471,15 @@ public class PriceBook {
          * Each of these WriteableChunks are used to process the update data more efficiently in linear chunks
          * instead of iterating over an index.  This avoids virtual method calls and is much more cache-friendly
          */
+        final WritableLongChunk<?> idChunk;
+        final WritableLongChunk<?> prevIdChunk;
+        final WritableObjectChunk<String, ?> symChunk;
         final WritableLongChunk<?> timeChunk;
         final WritableDoubleChunk<?> priceChunk;
         final WritableIntChunk<?> sizeChunk;
+        final WritableIntChunk<?> execSizeChunk;
         final WritableIntChunk<?> sideChunk;
         final WritableIntChunk<?> opChunk;
-        final WritableObjectChunk<?, ? extends Values> keyChunk;
 
         /*
          * The SharedContext and FillContexts are used by the column sources when they copy data into the chunks
@@ -552,27 +488,24 @@ public class PriceBook {
         final SharedContext sc;
         final List<ChunkSource.FillContext> fillContexts = new ArrayList<>(6);
 
-        /*
-         * The price buf is used to output the sorted bestN orders.  Since we are using PriorityQueue, which is a min heap
-         * there is way to walk the best N prices directly.  In order to avoid creating a bunch of array garbage for every
-         * row we emit,  this is used.
-         */
-        final Double[] priceBuf;
-
-        // rowsAdded keeps track of how many update rows were emitted so that the result index can be updated and a downstream
+        // Keep track of rows added, removed, or modified so that the result index can be updated and a downstream
         // update can be fired to anything listening to the result table.
-        long rowsAdded = 0;
+        WritableRowSet rowsAdded = RowSetFactory.empty();
+        WritableRowSet rowsRemoved = RowSetFactory.empty();
+        WritableRowSet rowsModified = RowSetFactory.empty();
 
-        Context(int depth) {
-            priceBuf  = new Double[depth];
+        Context() {
             sc = SharedContext.makeSharedContext();
 
-            timeChunk  = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
-            priceChunk = WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
-            sizeChunk  = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
-            sideChunk  = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
-            opChunk    = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
-            keyChunk   = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            idChunk         = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            prevIdChunk     = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            symChunk        = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            timeChunk       = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            priceChunk      = WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
+            sizeChunk       = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+            execSizeChunk   = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+            sideChunk       = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+            opChunk         = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
         }
 
         /**
@@ -583,12 +516,15 @@ public class PriceBook {
         public void close() {
             sc.close();
             fillContexts.forEach(ChunkSource.FillContext::close);
+            idChunk.close();
+            prevIdChunk.close();
+            symChunk.close();
             timeChunk.close();
             priceChunk.close();
             sizeChunk.close();
+            execSizeChunk.close();
             sideChunk.close();
             opChunk.close();
-            keyChunk.close();
         }
 
         /**
@@ -652,7 +588,8 @@ public class PriceBook {
          */
         @Override
         public void process() {
-            final RowSet addedIndex;
+            TableUpdateImpl resultUpdate = new TableUpdateImpl();
+
             // If the upstream listener has not fired (for example, if there were no upstream changes)
             // then do not try to process the updates -- there are none, we just need to blink the existing rows
             // out.
@@ -665,62 +602,62 @@ public class PriceBook {
                 }
 
                 // First process all of the new rows
-                final long rowsAdded = processAdded(upstream.added(), false);
+                processAdded(upstream.added(), false, resultUpdate);
 
                 // Handle the case where the input rows generate no book state changes,  we don't want to accidentally
                 // try to inject a -1 into the row set.
-                addedIndex = rowsAdded == 0 ? RowSetFactory.empty() : RowSetFactory.fromRange(0, rowsAdded - 1);
+
             } else {
-                addedIndex = RowSetFactory.empty();
+                resultUpdate.added = RowSetFactory.empty();
+                resultUpdate.removed = RowSetFactory.empty();
+                resultUpdate.modified = RowSetFactory.empty();
             }
 
+            resultUpdate.shifted = RowSetShiftData.EMPTY;
+            resultUpdate.modifiedColumnSet = ModifiedColumnSet.EMPTY;
             // Once the rows have been processed then we create update the result index with the new rows and fire an
             // update for any downstream listeners of the result table.
-            final RowSet removedIndex = resultIndex.copy();
-            resultIndex.update(addedIndex, removedIndex);
-            resultTable.notifyListeners(new TableUpdateImpl(addedIndex,
-                    removedIndex,
-                    RowSetFactory.empty(),
-                    RowSetShiftData.EMPTY,
-                    ModifiedColumnSet.EMPTY));
+            resultIndex.update(resultUpdate.added, resultUpdate.removed);
+            resultTable.notifyListeners(resultUpdate);
         }
     }
 
     /**
-     * Build a book of bid and ask prices with the specified number of levels from the requested table, grouping input rows by the
-     * specified set of grouping columns.  Levels will be represented as a set of columns (Price, Time, Size) for each level.
+     * Build a book of current live orders and their status
      *
      * @param source the table with the source data
-     * @param depth the desired book depth
-     * @param batchTimestamps set to true to batch input rows with identical timestamps into the a single output row.
+     * @param idColumnName the name of the source order id column
+     * @param symColumnName the name of the source order symbol column
      * @param timestampColumnName the name of the source timestamp column
+     * @param priceColumnName the name of the source price column
      * @param sizeColumnName the name of the source size column
      * @param sideColumnName the name of the source side column
      * @param opColumnName the name of the source book-op column
-     * @param priceColumnName the name of the price column
-     * @param groupingCols the columns to group the source table by
      *
      * @return a new table representing the current state of the book.  This table will update as the source table updates.
      */
     @SuppressWarnings("unused")
     public static QueryTable build(@NotNull Table source,
-                                   int depth,
-                                   boolean batchTimestamps,
+                                   @NotNull String idColumnName,
+                                   @NotNull String prevIdColumnName,
+                                   @NotNull String symColumnName,
                                    @NotNull String timestampColumnName,
-                                   @NotNull String sizeColumnName,
-                                   @NotNull String sideColumnName,
-                                   @NotNull String opColumnName,
                                    @NotNull String priceColumnName,
-                                   @NotNull String... groupingCols) {
+                                   @NotNull String sizeColumnName,
+                                   @NotNull String execSizeColumnName,
+                                   @NotNull String sideColumnName,
+                                   @NotNull String opColumnName
+                                   ) {
         final PriceBook book = new PriceBook(source,
-                depth,
-                batchTimestamps,
+                idColumnName,
+                prevIdColumnName,
+                symColumnName,
                 timestampColumnName,
-                sizeColumnName,
-                sideColumnName,
-                opColumnName,
                 priceColumnName,
-                groupingCols);
+                sizeColumnName,
+                execSizeColumnName,
+                sideColumnName,
+                opColumnName);
 
         return book.resultTable;
     }
