@@ -24,7 +24,7 @@ import java.util.*;
 import static io.deephaven.util.QueryConstants.*;
 
 /**
- * <p>Build a book of current live order</p>
+ * <p>Build a book of current live orders</p>
  * <p>
  *     Creating a price book is as simple as invoking the static build method, specifying the column names of
  *     your source table.
@@ -36,7 +36,9 @@ import static io.deephaven.util.QueryConstants.*;
  *                      .where("Date=`2021-01-13`", "Time > '2021-01-13T08:30:00 NY'")
  *                      .sort("Time")
  *
- *      book = PriceBook.build(orderStream)
+ *      book = PriceBook.build(orderStream,"ORD_ID", "PREV_ORD_ID", "SYMB", "EPOCH_TS",  "PRC",
+ *                "QTY", "EXEC_QTY", "SIDE", "EVT_ID")
+ *
  *      }</pre>
  *
  * <p></p>
@@ -52,7 +54,6 @@ public class PriceBook {
     private static final int OP_CC = 2;
     private static final int OP_INF = 3;
     private static final int OP_CRAK = 4;
-
 
     // Names of the output table columns
     private static final String UPDATE_TIME_NAME = "UpdateTimestamp";
@@ -74,7 +75,6 @@ public class PriceBook {
     private final ColumnSource<Integer> sideSource;
     private final ColumnSource<Integer> opSource;
     private final ColumnSource<String> symSource;
-
     // endregion
 
     // region OutputSources
@@ -90,15 +90,12 @@ public class PriceBook {
     final IntegerArraySource sideResults;
     final LongArraySource ordIdResults;
     final ObjectArraySource<String> symResults;
-
     // endregion
 
-    // region from BookState
-
+    // region Book state objects
     private final Long2LongOpenHashMap orderMap = new Long2LongOpenHashMap();
     private final LongOpenHashSet  availableRows = new LongOpenHashSet();
     private long  resultSize;
-
     // endregion
 
     private final boolean sourceIsBlink;
@@ -119,15 +116,15 @@ public class PriceBook {
         this.resultSize = 0;
 
         // Begin by getting references to the column sources from the input table to process later.
-        this.ordIdSource = source.getColumnSource(idColumnName);
-        this.prevOrderIdSource = source.getColumnSource(prevIdColumnName);
-        this.symSource = source.getColumnSource(symColumnName);
-        this.orderTimeSource = ReinterpretUtils.instantToLongSource(source.getColumnSource(timestampColumnName));
-        this.priceSource = source.getColumnSource(priceColumnName);
-        this.sizeSource = source.getColumnSource(sizeColumnName);
-        this.execSizeSource = source.getColumnSource(execSizeColumnName);
-        this.sideSource = source.getColumnSource(sideColumnName);
-        this.opSource = source.getColumnSource(opColumnName);
+        this.ordIdSource        = source.getColumnSource(idColumnName);
+        this.prevOrderIdSource  = source.getColumnSource(prevIdColumnName);
+        this.symSource          = source.getColumnSource(symColumnName);
+        this.orderTimeSource    = ReinterpretUtils.instantToLongSource(source.getColumnSource(timestampColumnName));
+        this.priceSource        = source.getColumnSource(priceColumnName);
+        this.sizeSource         = source.getColumnSource(sizeColumnName);
+        this.execSizeSource     = source.getColumnSource(execSizeColumnName);
+        this.sideSource         = source.getColumnSource(sideColumnName);
+        this.opSource           = source.getColumnSource(opColumnName);
 
         // Construct the new column sources and result table.
         final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
@@ -138,12 +135,12 @@ public class PriceBook {
         columnSourceMap.put(UPDATE_TIME_NAME, updateTimeResults);
 
         // Set output table columns
-        ordIdResults = new LongArraySource();
-        symResults = new ObjectArraySource(String.class);
-        orderTimeResults = new InstantArraySource();
-        priceResults = new DoubleArraySource();
-        sizeResults = new IntegerArraySource();
-        sideResults = new IntegerArraySource();
+        ordIdResults        = new LongArraySource();
+        symResults          = new ObjectArraySource(String.class);
+        orderTimeResults    = new InstantArraySource();
+        priceResults        = new DoubleArraySource();
+        sizeResults         = new IntegerArraySource();
+        sideResults         = new IntegerArraySource();
 
         columnSourceMap.put(ORDID_NAME, ordIdResults);
         columnSourceMap.put(SYM_NAME, symResults);
@@ -170,9 +167,6 @@ public class PriceBook {
 
                     WritableRowSet resultRows = (WritableRowSet) resultUpdate.added;
                     resultRows.remove(resultUpdate.removed);
-
-                    // Is this any better?
-                    // ((WritableRowSet) resultUpdate.added).remove(resultUpdate.removed);
 
                     final QueryTable bookTable = new QueryTable( (resultRows).toTracking(), columnSourceMap);
 
@@ -228,15 +222,15 @@ public class PriceBook {
 
             // In order to copy data into the writable chunks in the context we need to create
             // a fill context for each column we'll be copying
-            final ChunkSource.FillContext oidfc = ctx.makeFillContext(ordIdSource);
-            final ChunkSource.FillContext poidfc = ctx.makeFillContext(prevOrderIdSource);
-            final ChunkSource.FillContext symfc = ctx.makeFillContext(symSource);
-            final ChunkSource.FillContext timefc = ctx.makeFillContext(orderTimeSource);
-            final ChunkSource.FillContext pricefc = ctx.makeFillContext(priceSource);
-            final ChunkSource.FillContext sizefc = ctx.makeFillContext(sizeSource);
-            final ChunkSource.FillContext esizefc = ctx.makeFillContext(execSizeSource);
-            final ChunkSource.FillContext sidefc = ctx.makeFillContext(sideSource);
-            final ChunkSource.FillContext opfc = ctx.makeFillContext(opSource);
+            final ChunkSource.FillContext oidfc     = ctx.makeFillContext(ordIdSource);
+            final ChunkSource.FillContext poidfc    = ctx.makeFillContext(prevOrderIdSource);
+            final ChunkSource.FillContext symfc     = ctx.makeFillContext(symSource);
+            final ChunkSource.FillContext timefc    = ctx.makeFillContext(orderTimeSource);
+            final ChunkSource.FillContext pricefc   = ctx.makeFillContext(priceSource);
+            final ChunkSource.FillContext sizefc    = ctx.makeFillContext(sizeSource);
+            final ChunkSource.FillContext esizefc   = ctx.makeFillContext(execSizeSource);
+            final ChunkSource.FillContext sidefc    = ctx.makeFillContext(sideSource);
+            final ChunkSource.FillContext opfc      = ctx.makeFillContext(opSource);
 
 
             // Now process the entire added index in chunks of CHUNK_SIZE (2048) rows.
@@ -366,15 +360,16 @@ public class PriceBook {
 
 
     /**
-     * Update the specified order in the book.  If the order was new add it to the bookstate.
+     * Add the specified order to the book.  If the order was new add it to the bookstate.
      *
+     * @param ctx the context used to update the removed and added rowsets
      * @param orderId the order id
-     *
-     * If you find a match in the map, you are done
-     * If not, see if you have a reclaimed row you can use,  use that
-     * If not, get and increment the counter and use that row.
-     * Insert the row from (a,b,c) into the output tables RowSet
-     * Write / Read values in the ColumnSources at whichever row number you got from (a,b,c)
+     * @param sym the symbol of the order
+     * @param time the timestamp of the order
+     * @param price the price of the order
+     * @param size the size of the order
+     * @param side the side of the order
+     * @param timeNow the time the order is updated in the book
      *
      */
     private void addOrder(Context ctx,
@@ -450,6 +445,7 @@ public class PriceBook {
      * @param ctx the context of the update cycle to update
      * @param size the order to subtract from the current size
      * @param orderRow the row key to be modified
+     * @param replace whether to replace or subtract the size from the original size
      *
      */
     private void modifyOrder(Context ctx, int size, long orderRow, boolean replace) {
@@ -501,15 +497,15 @@ public class PriceBook {
         Context() {
             sc = SharedContext.makeSharedContext();
 
-            idChunk   = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
-            prevIdChunk   = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
-            symChunk   = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
-            timeChunk  = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
-            priceChunk = WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
-            sizeChunk  = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
-            execSizeChunk  = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
-            sideChunk  = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
-            opChunk    = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+            idChunk         = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            prevIdChunk     = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            symChunk        = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            timeChunk       = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            priceChunk      = WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
+            sizeChunk       = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+            execSizeChunk   = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+            sideChunk       = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+            opChunk         = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
         }
 
         /**
