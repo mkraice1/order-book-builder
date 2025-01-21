@@ -319,7 +319,7 @@ public class PriceBook {
                             if (existingOrderRow != -1) {
                                 this.modifyOrder(ctx, execSize, existingOrderRow, false);
                             } else {
-                                System.out.println(ordId + " doesn't not exist, can't modify order.");
+                                System.out.println(ordId + " does not exist, can't modify order.");
                             }
                         }
 
@@ -345,12 +345,11 @@ public class PriceBook {
                                 }
 
                             } else {
-                                // Just update the same order (replace or subtract?)
                                 if (existingOrderRow != -1) {
                                     final int execSize = ctx.execSizeChunk.get(ii);
                                     this.modifyOrder(ctx, execSize, existingOrderRow, true);
                                 } else {
-                                    System.out.println(ordId + " doesn't not exist, can't modify order.");
+                                    System.out.println(ordId + " does not exist, can't modify order.");
                                 }
 
                             }
@@ -359,10 +358,9 @@ public class PriceBook {
 
                 }
             }
-
-            resultUpdate.added = ctx.rowsAdded.build();
-            resultUpdate.removed = ctx.rowsRemoved.build();
-            resultUpdate.modified = ctx.rowsModified.build();
+            resultUpdate.added = ctx.rowsAdded;
+            resultUpdate.removed = ctx.rowsRemoved;
+            resultUpdate.modified = ctx.rowsModified;
         }
     }
 
@@ -394,6 +392,9 @@ public class PriceBook {
             rowOfAdded = availableRows.iterator().nextLong();  // Grab any element
             availableRows.remove(rowOfAdded);  // Remove it from the set
 
+            // If we are re-using a row index, we might have used it to remove in the same cycle
+            ctx.rowsRemoved.remove(rowOfAdded);
+
         } else {
             // No open spots, so expand the size of the columns
             rowOfAdded = resultSize;
@@ -410,8 +411,7 @@ public class PriceBook {
 
         //Add map from id to row num
         orderMap.put(orderId, rowOfAdded);
-        ctx.rowsAdded.addKey(rowOfAdded);
-//        ctx.rowsRemoved.removeKey(rowOfAdded);
+        ctx.rowsAdded.insert(rowOfAdded);
 
         ordIdResults.set(rowOfAdded, orderId);
         symResults.set(rowOfAdded, sym);
@@ -436,9 +436,11 @@ public class PriceBook {
 
         if (rowOfRemoved != -1){
             availableRows.add(rowOfRemoved);
-            ctx.rowsRemoved.addKey(rowOfRemoved);
+            ctx.rowsRemoved.insert(rowOfRemoved);
+            ctx.rowsAdded.remove(rowOfRemoved);
+            ctx.rowsModified.remove(rowOfRemoved);
         } else {
-            System.out.println(orderId + " doesn't exists, can't remove order.");
+            System.out.println(orderId + " does not exist, can't remove order.");
         }
     }
 
@@ -460,7 +462,7 @@ public class PriceBook {
             sizeResults.set(orderRow, currSize - size);
         }
 
-        ctx.rowsModified.addKey(orderRow);
+        ctx.rowsModified.insert(orderRow);
     }
 
 
@@ -492,9 +494,9 @@ public class PriceBook {
 
         // Keep track of rows added, removed, or modified so that the result index can be updated and a downstream
         // update can be fired to anything listening to the result table.
-        RowSetBuilderRandom rowsAdded = RowSetFactory.builderRandom();
-        RowSetBuilderRandom rowsRemoved = RowSetFactory.builderRandom();
-        RowSetBuilderRandom rowsModified = RowSetFactory.builderRandom();
+        WritableRowSet rowsAdded = RowSetFactory.empty();
+        WritableRowSet rowsRemoved = RowSetFactory.empty();
+        WritableRowSet rowsModified = RowSetFactory.empty();
 
         Context() {
             sc = SharedContext.makeSharedContext();
