@@ -109,7 +109,8 @@ public class PriceBook {
                       @NotNull String sizeColumnName,
                       @NotNull String execSizeColumnName,
                       @NotNull String sideColumnName,
-                      @NotNull String opColumnName) {
+                      @NotNull String opColumnName,
+                      Table snapshot) {
         final QueryTable source = (QueryTable) table.coalesce();
         this.sourceIsBlink = BlinkTableTools.isBlink(source);
         this.orderMap.defaultReturnValue(-1);
@@ -155,17 +156,31 @@ public class PriceBook {
 
         final MutableObject<QueryTable> result = new MutableObject<>();
         final MutableObject<BookListener> listenerHolder = new MutableObject<>();
+        final WritableRowSet snapAdded;
+
+
+        if (snapshot != null) {
+            // Process the snapshot first
+            TableUpdateImpl resultUpdate = new TableUpdateImpl();
+            processInitBook(snapshot, resultUpdate);
+            snapAdded = (WritableRowSet) resultUpdate.added;
+        } else {
+            snapAdded = RowSetFactory.empty();
+        }
+
         QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
                 (prevRequested, beforeClock) -> {
                     final boolean usePrev = prevRequested && source.isRefreshing();
 
                     // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
                     // the LTM thread and so it must know if it should use previous values or current values.
-
+                    // Using the same update from processInitBook if there was a snapshot
                     TableUpdateImpl resultUpdate = new TableUpdateImpl();
                     processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev, resultUpdate);
 
                     WritableRowSet resultRows = (WritableRowSet) resultUpdate.added;
+                    // Add rows from snapshot.
+                    resultRows.insert(snapAdded);
                     resultRows.remove(resultUpdate.removed);
 
                     final QueryTable bookTable = new QueryTable( (resultRows).toTracking(), columnSourceMap);
@@ -266,6 +281,12 @@ public class PriceBook {
 
 
                 final Instant timeNow = Instant.now();
+                Instant now = Instant.now();
+
+                long seconds = now.getEpochSecond();
+                int nanos = now.getNano();
+
+                long nowNanos = seconds * 1_000_000_000L + nanos;
 
                 // Iterate over each row in the processing chunk,  and update the book.
                 for(int ii = 0; ii< nextKeys.size(); ii++) {
@@ -298,7 +319,7 @@ public class PriceBook {
                                 final double price = ctx.priceChunk.get(ii);
                                 final int side = ctx.sideChunk.get(ii);
 
-                                this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
+                                this.addOrder(ctx, ordId, sym, timestamp, price, size, side, nowNanos);
 
                             } else {
                                 System.out.println(ordId + " already exists, can't add order.");
@@ -311,7 +332,7 @@ public class PriceBook {
                             final long existingOrderRow = orderMap.get(ordId);
                             final int execSize = ctx.execSizeChunk.get(ii);
                             if (existingOrderRow != -1) {
-                                this.modifyOrder(ctx, execSize, existingOrderRow, false);
+                                this.modifyOrder(ctx, execSize, existingOrderRow, false, nowNanos);
                             } else {
                                 System.out.println(ordId + " does not exist, can't modify order.");
                             }
@@ -333,7 +354,7 @@ public class PriceBook {
                                     final double price = ctx.priceChunk.get(ii);
                                     final int side = ctx.sideChunk.get(ii);
 
-                                    this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
+                                    this.addOrder(ctx, ordId, sym, timestamp, price, size, side, nowNanos);
                                 } else {
                                     System.out.println(ordId + " already exists, can't add order.");
                                 }
@@ -341,7 +362,7 @@ public class PriceBook {
                             } else {
                                 if (existingOrderRow != -1) {
                                     final int execSize = ctx.execSizeChunk.get(ii);
-                                    this.modifyOrder(ctx, execSize, existingOrderRow, true);
+                                    this.modifyOrder(ctx, execSize, existingOrderRow, true, nowNanos);
                                 } else {
                                     System.out.println(ordId + " does not exist, can't modify order.");
                                 }
@@ -355,6 +376,73 @@ public class PriceBook {
             resultUpdate.added = ctx.rowsAdded;
             resultUpdate.removed = ctx.rowsRemoved;
             resultUpdate.modified = ctx.rowsModified;
+        }
+    }
+
+    /**
+     * Process all rows from a book table snapshot
+     *
+     * @param t the snapshot of the book table
+     * @return the Map of grouping keys to BookState
+     */
+    final void processInitBook(final Table t, TableUpdateImpl resultUpdate) {
+        // Must be static
+        assert !t.isRefreshing();
+
+        final ColumnSource<Long> updateTimeSource = ReinterpretUtils.instantToLongSource(t.getColumnSource(UPDATE_TIME_NAME));
+        final ColumnSource<Long> ordIdSource = t.getColumnSource(ORDID_NAME);
+        final ColumnSource<String> symbolSource = t.getColumnSource(SYM_NAME);
+        final ColumnSource<Long> ordTimeSource = ReinterpretUtils.instantToLongSource(t.getColumnSource(ORD_TIME_NAME));
+        final ColumnSource<Double> priceSource = t.getColumnSource(PRC_NAME);
+        final ColumnSource<Double> sizeSource = t.getColumnSource(SIZE_NAME);
+        final ColumnSource<Double> sideSource = t.getColumnSource(SIDE_NAME);
+
+
+        try(final InitContext context = new InitContext()) {
+            // Next we get an iterator into the added index so that we can process the update in chunks.
+            final RowSequence.Iterator okit = t.getRowSet().getRowSequenceIterator();
+
+            final ChunkSource.FillContext uptimefc  = context.makeFillContext(updateTimeSource);
+            final ChunkSource.FillContext oidfc     = context.makeFillContext(ordIdSource);
+            final ChunkSource.FillContext symfc     = context.makeFillContext(symbolSource);
+            final ChunkSource.FillContext ordtimefc = context.makeFillContext(ordTimeSource);
+            final ChunkSource.FillContext pricefc   = context.makeFillContext(priceSource);
+            final ChunkSource.FillContext sizefc    = context.makeFillContext(sizeSource);
+            final ChunkSource.FillContext sidefc    = context.makeFillContext(sideSource);
+
+
+            while (okit.hasMore()) {
+                context.sc.reset();
+
+                // Grab up to the next CHUNK_SIZE rows
+                final RowSequence nextKeys = okit.getNextRowSequenceWithLength(CHUNK_SIZE);
+
+                updateTimeSource.fillChunk(uptimefc, (WritableChunk<? super Values>) context.updateTimeChunk, nextKeys);
+                ordIdSource.fillChunk(oidfc, (WritableChunk<? super Values>) context.idChunk, nextKeys);
+                symbolSource.fillChunk(symfc, (WritableChunk<? super Values>) context.symChunk, nextKeys);
+                ordTimeSource.fillChunk(ordtimefc, (WritableChunk<? super Values>) context.orderTimeChunk, nextKeys);
+                priceSource.fillChunk(pricefc, (WritableChunk<? super Values>) context.priceChunk, nextKeys);
+                sizeSource.fillChunk(sizefc, (WritableChunk<? super Values>) context.sizeChunk, nextKeys);
+                sideSource.fillChunk(sidefc, (WritableChunk<? super Values>) context.sideChunk, nextKeys);
+
+                for(int ii = 0; ii< nextKeys.size(); ii++) {
+                    // Get some minimal data
+                    final long updateTime = context.updateTimeChunk.get(ii);
+                    final long ordId = context.idChunk.get(ii);
+                    final String sym = context.symChunk.get(ii);
+                    final long orderTime = context.orderTimeChunk.get(ii);
+                    final int size = context.sizeChunk.get(ii);
+                    final double price = context.priceChunk.get(ii);
+                    final int side = context.sideChunk.get(ii);
+
+                    // Add every order
+                    // addOrder needs to accept both Contexts
+                    this.addOrder(context, ordId, sym, orderTime, price, size, side, updateTime);
+                }
+            }
+
+            // We are only adding rows when initing from snapshot
+            resultUpdate.added = context.rowsAdded;
         }
     }
 
@@ -372,15 +460,16 @@ public class PriceBook {
      * @param timeNow the time the order is updated in the book
      *
      */
-    private void addOrder(Context ctx,
-                          long orderId,
-                          String sym,
-                          long time,
-                          double price,
-                          int size,
-                          int side,
-                          Instant timeNow) {
+    private void addOrder(final BaseContext ctx,
+                          final long orderId,
+                          final String sym,
+                          final long time,
+                          final double price,
+                          final int size,
+                          final int side,
+                          final long timeNow) {
         long rowOfAdded;
+        boolean removeRemove = false;
 
         // Find an open slot or increment the row counter
         if (!availableRows.isEmpty()) {
@@ -388,7 +477,7 @@ public class PriceBook {
             availableRows.remove(rowOfAdded);  // Remove it from the set
 
             // If we are re-using a row index, we might have used it to remove in the same cycle
-            ctx.rowsRemoved.remove(rowOfAdded);
+            removeRemove = true;
 
         } else {
             // No open spots, so expand the size of the columns
@@ -406,7 +495,7 @@ public class PriceBook {
 
         //Add map from id to row num
         orderMap.put(orderId, rowOfAdded);
-        ctx.rowsAdded.insert(rowOfAdded);
+        ctx.addRow(rowOfAdded, removeRemove);
 
         ordIdResults.set(rowOfAdded, orderId);
         symResults.set(rowOfAdded, sym);
@@ -431,9 +520,7 @@ public class PriceBook {
 
         if (rowOfRemoved != -1){
             availableRows.add(rowOfRemoved);
-            ctx.rowsRemoved.insert(rowOfRemoved);
-            ctx.rowsAdded.remove(rowOfRemoved);
-            ctx.rowsModified.remove(rowOfRemoved);
+            ctx.removeRow(rowOfRemoved);
         } else {
             System.out.println(orderId + " does not exist, can't remove order.");
         }
@@ -448,7 +535,7 @@ public class PriceBook {
      * @param replace whether to replace or subtract the size from the original size
      *
      */
-    private void modifyOrder(Context ctx, int size, long orderRow, boolean replace) {
+    private void modifyOrder(Context ctx, int size, long orderRow, boolean replace, long nowNanos) {
 
         if (replace) {
             sizeResults.set(orderRow, size);
@@ -458,7 +545,15 @@ public class PriceBook {
             sizeResults.set(orderRow, currSize - size);
         }
 
-        ctx.rowsModified.insert(orderRow);
+        updateTimeResults.set(orderRow, nowNanos);
+        ctx.modifyRow(orderRow);
+    }
+
+    private interface BaseContext extends SafeCloseable {
+        // Keep track of rows added, removed, or modified so that the result index can be updated and a downstream
+        // update can be fired to anything listening to the result table.
+        void addRow(long rowI, boolean removeRemove);
+        ChunkSource.FillContext makeFillContext(ChunkSource<?> cs);
     }
 
 
@@ -466,7 +561,7 @@ public class PriceBook {
      * This class holds various objects that are used during an update cycle.  This includes chunks for holding and processing
      * the updates, as well as the counts of rows added and a buffer for logging sorted prices.
      */
-    private static class Context implements SafeCloseable {
+    private static class Context implements BaseContext {
         /*
          * Each of these WriteableChunks are used to process the update data more efficiently in linear chunks
          * instead of iterating over an index.  This avoids virtual method calls and is much more cache-friendly
@@ -481,18 +576,16 @@ public class PriceBook {
         final WritableIntChunk<?> sideChunk;
         final WritableIntChunk<?> opChunk;
 
+        WritableRowSet rowsAdded = RowSetFactory.empty();
+        WritableRowSet rowsRemoved = RowSetFactory.empty();
+        WritableRowSet rowsModified = RowSetFactory.empty();
+
         /*
          * The SharedContext and FillContexts are used by the column sources when they copy data into the chunks
          * above in order to share resources within a single update cycle.
          */
         final SharedContext sc;
-        final List<ChunkSource.FillContext> fillContexts = new ArrayList<>(6);
-
-        // Keep track of rows added, removed, or modified so that the result index can be updated and a downstream
-        // update can be fired to anything listening to the result table.
-        WritableRowSet rowsAdded = RowSetFactory.empty();
-        WritableRowSet rowsRemoved = RowSetFactory.empty();
-        WritableRowSet rowsModified = RowSetFactory.empty();
+        final List<ChunkSource.FillContext> fillContexts = new ArrayList<>(9);
 
         Context() {
             sc = SharedContext.makeSharedContext();
@@ -506,6 +599,24 @@ public class PriceBook {
             execSizeChunk   = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
             sideChunk       = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
             opChunk         = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+        }
+
+
+        public void addRow(long rowI, boolean removeRemove) {
+            rowsAdded.insert(rowI);
+            if (removeRemove) {
+                rowsRemoved.remove(rowI);
+            }
+        }
+
+        public void removeRow(long rowI) {
+            rowsRemoved.insert(rowI);
+            rowsAdded.remove(rowI);
+            rowsModified.remove(rowI);
+        }
+
+        public void modifyRow(long rowI) {
+            rowsModified.insert(rowI);
         }
 
         /**
@@ -533,7 +644,83 @@ public class PriceBook {
          * @param cs the column source
          * @return a new fill context for that source.
          */
-        ChunkSource.FillContext makeFillContext(ChunkSource<?> cs) {
+        public ChunkSource.FillContext makeFillContext(ChunkSource<?> cs) {
+            final ChunkSource.FillContext fc = cs.makeFillContext(CHUNK_SIZE, sc);
+            fillContexts.add(fc);
+            return fc;
+        }
+    }
+
+    /**
+     * Specific context for processes a book snapshot
+     */
+    private static class InitContext implements BaseContext {
+        /*
+         * Each of these WriteableChunks are used to process the update data more efficiently in linear chunks
+         * instead of iterating over an index.  This avoids virtual method calls and is much more cache-friendly
+         */
+        final WritableLongChunk<?> updateTimeChunk;
+        final WritableLongChunk<?> idChunk;
+        final WritableObjectChunk<String, ?> symChunk;
+        final WritableLongChunk<?> orderTimeChunk;
+        final WritableDoubleChunk<?> priceChunk;
+        final WritableIntChunk<?> sizeChunk;
+        final WritableIntChunk<?> sideChunk;
+
+        WritableRowSet rowsAdded = RowSetFactory.empty();
+        WritableRowSet rowsRemoved = RowSetFactory.empty();
+
+        public void addRow(long rowI, boolean removeRemove) {
+            rowsAdded.insert(rowI);
+            if (removeRemove) {
+                rowsRemoved.remove(rowI);
+            }
+        }
+
+
+        /*
+         * The SharedContext and FillContexts are used by the column sources when they copy data into the chunks
+         * above in order to share resources within a single update cycle.
+         */
+        final SharedContext sc;
+        final List<ChunkSource.FillContext> fillContexts = new ArrayList<>(7);
+
+        InitContext() {
+            sc = SharedContext.makeSharedContext();
+
+            updateTimeChunk = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            idChunk         = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            symChunk        = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+            orderTimeChunk  = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            priceChunk      = WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
+            sizeChunk       = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+            sideChunk       = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+        }
+
+        /**
+         * At the end of an update cycle this must be invoked to close and release any shared resources that were claimed
+         * during the update cycle.
+         */
+        @Override
+        public void close() {
+            sc.close();
+            fillContexts.forEach(ChunkSource.FillContext::close);
+            updateTimeChunk.close();
+            idChunk.close();
+            symChunk.close();
+            orderTimeChunk.close();
+            priceChunk.close();
+            sizeChunk.close();
+            sideChunk.close();
+        }
+
+        /**
+         * Just a helper method to create fill contexts and save them so they can be cleaned up neatly on close.
+         *
+         * @param cs the column source
+         * @return a new fill context for that source.
+         */
+        public ChunkSource.FillContext makeFillContext(ChunkSource<?> cs) {
             final ChunkSource.FillContext fc = cs.makeFillContext(CHUNK_SIZE, sc);
             fillContexts.add(fc);
             return fc;
@@ -646,7 +833,8 @@ public class PriceBook {
                                    @NotNull String sizeColumnName,
                                    @NotNull String execSizeColumnName,
                                    @NotNull String sideColumnName,
-                                   @NotNull String opColumnName
+                                   @NotNull String opColumnName,
+                                   Table snapshot
                                    ) {
         final PriceBook book = new PriceBook(source,
                 idColumnName,
@@ -657,7 +845,8 @@ public class PriceBook {
                 sizeColumnName,
                 execSizeColumnName,
                 sideColumnName,
-                opColumnName);
+                opColumnName,
+                snapshot);
 
         return book.resultTable;
     }
