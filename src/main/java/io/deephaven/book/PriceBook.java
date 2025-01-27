@@ -174,7 +174,6 @@ public class PriceBook {
 
                     // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
                     // the LTM thread and so it must know if it should use previous values or current values.
-                    // Using the same update from processInitBook if there was a snapshot
                     TableUpdateImpl resultUpdate = new TableUpdateImpl();
                     processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev, resultUpdate);
 
