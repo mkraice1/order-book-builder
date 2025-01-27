@@ -300,8 +300,6 @@ public class PriceBook {
 
                                 this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
 
-                            } else {
-                                System.out.println(ordId + " already exists, can't add order.");
                             }
                         }
 
@@ -312,8 +310,6 @@ public class PriceBook {
                             final int execSize = ctx.execSizeChunk.get(ii);
                             if (existingOrderRow != -1) {
                                 this.modifyOrder(ctx, execSize, existingOrderRow, false);
-                            } else {
-                                System.out.println(ordId + " does not exist, can't modify order.");
                             }
                         }
 
@@ -334,18 +330,13 @@ public class PriceBook {
                                     final int side = ctx.sideChunk.get(ii);
 
                                     this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
-                                } else {
-                                    System.out.println(ordId + " already exists, can't add order.");
                                 }
 
                             } else {
                                 if (existingOrderRow != -1) {
                                     final int execSize = ctx.execSizeChunk.get(ii);
                                     this.modifyOrder(ctx, execSize, existingOrderRow, true);
-                                } else {
-                                    System.out.println(ordId + " does not exist, can't modify order.");
                                 }
-
                             }
                         }
                     }
