@@ -425,8 +425,6 @@ public class PriceBook {
             ctx.rowsRemoved.insert(rowOfRemoved);
             ctx.rowsAdded.remove(rowOfRemoved);
             ctx.rowsModified.remove(rowOfRemoved);
-        } else {
-            System.out.println(orderId + " does not exist, can't remove order.");
         }
     }
 
