@@ -115,6 +115,7 @@ public class PriceBook {
         this.orderMap.defaultReturnValue(-1);
         this.resultSize = 0;
 
+
         // Begin by getting references to the column sources from the input table to process later.
         this.ordIdSource        = source.getColumnSource(idColumnName);
         this.prevOrderIdSource  = source.getColumnSource(prevIdColumnName);
@@ -288,7 +289,6 @@ public class PriceBook {
                     switch (op) {
                         case OP_OAK -> {
                             final long existingOrderRow = orderMap.get(ordId);
-
                             // If the order doesn't already exist, add it
                             // TODO: Do we care if we try to ack an order already ack'd? Should we complain?
                             if (existingOrderRow == -1) {
@@ -334,13 +334,11 @@ public class PriceBook {
 
                             } else {
                                 if (existingOrderRow != -1) {
-                                    final int execSize = ctx.execSizeChunk.get(ii);
-                                    this.modifyOrder(ctx, execSize, existingOrderRow, true);
+                                    this.modifyOrder(ctx, size, existingOrderRow, true);
                                 }
                             }
                         }
                     }
-
                 }
             }
             resultUpdate.added = ctx.rowsAdded;
@@ -378,8 +376,13 @@ public class PriceBook {
             rowOfAdded = availableRows.iterator().nextLong();  // Grab any element
             availableRows.remove(rowOfAdded);  // Remove it from the set
 
-            // If we are re-using a row index, we might have used it to remove in the same cycle
-            ctx.rowsRemoved.remove(rowOfAdded);
+            // Only add to added RowSet if this rowI was not removed in this cycle
+            // otherwise just remove from removed.
+            if (ctx.rowsRemoved.find(rowOfAdded) >= 0) {
+                ctx.rowsRemoved.remove(rowOfAdded);
+            } else {
+                ctx.rowsAdded.insert(rowOfAdded);
+            }
 
         } else {
             // No open spots, so expand the size of the columns
@@ -393,11 +396,14 @@ public class PriceBook {
             sizeResults.ensureCapacity(resultSize);
             sideResults.ensureCapacity(resultSize);
             updateTimeResults.ensureCapacity(resultSize);
+
+            ctx.rowsAdded.insert(rowOfAdded);
+
         }
+
 
         //Add map from id to row num
         orderMap.put(orderId, rowOfAdded);
-        ctx.rowsAdded.insert(rowOfAdded);
 
         ordIdResults.set(rowOfAdded, orderId);
         symResults.set(rowOfAdded, sym);
@@ -416,15 +422,20 @@ public class PriceBook {
      *
      */
     private void removeOrder(Context ctx, long orderId) {
-        final long rowOfRemoved;
-
-        rowOfRemoved = orderMap.remove(orderId);
+        final long rowOfRemoved = orderMap.remove(orderId);
 
         if (rowOfRemoved != -1){
+            // Only add to removed rowset if this was not added in this cycle
+            // otherwise just remove from added
+            if (ctx.rowsAdded.find(rowOfRemoved) >= 0) {
+                ctx.rowsAdded.remove(rowOfRemoved);
+            } else {
+                ctx.rowsRemoved.insert(rowOfRemoved);
+                ctx.rowsModified.remove(rowOfRemoved);
+            }
+
+
             availableRows.add(rowOfRemoved);
-            ctx.rowsRemoved.insert(rowOfRemoved);
-            ctx.rowsAdded.remove(rowOfRemoved);
-            ctx.rowsModified.remove(rowOfRemoved);
         }
     }
 
@@ -447,7 +458,11 @@ public class PriceBook {
             sizeResults.set(orderRow, currSize - size);
         }
 
-        ctx.rowsModified.insert(orderRow);
+        // Only add to mods if this rowI was not already added this cycle
+        // If this row was added in this cycle, then this mod should be considered just an add (do nothing)
+        if (ctx.rowsAdded.find(orderRow) < 0) {
+            ctx.rowsModified.insert(orderRow);
+        }
     }
 
 
@@ -514,6 +529,10 @@ public class PriceBook {
             execSizeChunk.close();
             sideChunk.close();
             opChunk.close();
+
+//            rowsAdded.close();
+//            rowsRemoved.close();
+//            rowsModified.close();
         }
 
         /**
