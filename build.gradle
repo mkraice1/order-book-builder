@@ -5,7 +5,7 @@ plugins {
 }
 
 group 'io.deephaven'
-version "1.02-${dhcVersion}"
+version "1.1-${dhcVersion}"
 
 allprojects {
     repositories {

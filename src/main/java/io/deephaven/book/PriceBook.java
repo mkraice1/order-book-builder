@@ -1,7 +1,12 @@
 package io.deephaven.book;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
 import java.lang.String;
 import java.time.Instant;
+
+import io.deephaven.base.log.LogOutput;
 import io.deephaven.chunk.*;
 import io.deephaven.chunk.attributes.Values;
 import io.deephaven.engine.rowset.*;
@@ -12,14 +17,18 @@ import io.deephaven.engine.table.impl.sources.InstantArraySource;
 import io.deephaven.engine.table.impl.sources.IntegerArraySource;
 import io.deephaven.engine.table.impl.sources.ObjectArraySource;
 import io.deephaven.engine.table.impl.sources.LongArraySource;
+import io.deephaven.io.log.impl.LogOutputStringImpl;
 import io.deephaven.util.SafeCloseable;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+
+import io.deephaven.base.Base64;
 
 import org.jetbrains.annotations.NotNull;
 import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
 
 import java.util.*;
+import java.util.function.BiConsumer;
 
 import static io.deephaven.util.QueryConstants.*;
 
@@ -431,10 +440,9 @@ public class PriceBook {
                 ctx.rowsAdded.remove(rowOfRemoved);
             } else {
                 ctx.rowsRemoved.insert(rowOfRemoved);
-                ctx.rowsModified.remove(rowOfRemoved);
             }
 
-
+            ctx.rowsModified.remove(rowOfRemoved);
             availableRows.add(rowOfRemoved);
         }
     }
@@ -612,6 +620,14 @@ public class PriceBook {
                 // First process all of the new rows
                 processAdded(upstream.added(), false, resultUpdate);
 
+                if (resultUpdate.modified.isEmpty()) {
+                    resultUpdate.modifiedColumnSet = ModifiedColumnSet.EMPTY;
+                } else {
+//                    Map<String, ColumnSource<?>> modSet = new LinkedHashMap<>();
+//                    modSet.put("Size", sizeResults);
+                    resultUpdate.modifiedColumnSet = ModifiedColumnSet.ALL;
+                }
+
                 // Handle the case where the input rows generate no book state changes,  we don't want to accidentally
                 // try to inject a -1 into the row set.
 
@@ -619,15 +635,41 @@ public class PriceBook {
                 resultUpdate.added = RowSetFactory.empty();
                 resultUpdate.removed = RowSetFactory.empty();
                 resultUpdate.modified = RowSetFactory.empty();
+                resultUpdate.modifiedColumnSet = ModifiedColumnSet.EMPTY;
             }
 
             resultUpdate.shifted = RowSetShiftData.EMPTY;
-            resultUpdate.modifiedColumnSet = ModifiedColumnSet.EMPTY;
+            resultIndex.update(resultUpdate.added, resultUpdate.removed);
+            System.out.println(printUpdate(resultUpdate));
             // Once the rows have been processed then we create update the result index with the new rows and fire an
             // update for any downstream listeners of the result table.
-            resultIndex.update(resultUpdate.added, resultUpdate.removed);
             resultTable.notifyListeners(resultUpdate);
         }
+    }
+
+    private String printUpdate(TableUpdateImpl update) {
+        final RowSet removalsMinusPrevious = update.removed().minus(resultIndex.copyPrev());
+        final RowSet addedMinusCurrent = update.added().minus(resultIndex);
+        final RowSet removedIntersectCurrent = update.removed().intersect(resultIndex);
+        final RowSet modifiedMinusCurrent = update.modified().minus(resultIndex);
+
+        // Everything is messed up for this table, print out the indices in an easy to understand way
+        final LogOutput logOutput = new LogOutputStringImpl()
+                .append("RowSet update: ")
+                .append(LogOutput::nl).append("\t          previousIndex=").append(resultIndex.copyPrev())
+                .append(LogOutput::nl).append("\t           currentIndex=").append(resultIndex)
+                .append(LogOutput::nl).append("\t                  added=").append(update.added())
+                .append(LogOutput::nl).append("\t                removed=").append(update.removed())
+                .append(LogOutput::nl).append("\t               modified=").append(update.modified())
+                .append(LogOutput::nl).append("\t           modifiedCols=").append(update.modifiedColumnSet().toString())
+                .append(LogOutput::nl).append("\t                shifted=").append(update.shifted().toString())
+                .append(LogOutput::nl).append("\t  removalsMinusPrevious=").append(removalsMinusPrevious)
+                .append(LogOutput::nl).append("\t      addedMinusCurrent=").append(addedMinusCurrent)
+                .append(LogOutput::nl).append("\t   modifiedMinusCurrent=").append(modifiedMinusCurrent);
+
+
+
+        return logOutput.toString();
     }
 
     /**
