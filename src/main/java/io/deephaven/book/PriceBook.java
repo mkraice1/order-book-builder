@@ -241,6 +241,7 @@ public class PriceBook {
             final ChunkSource.FillContext esizefc   = ctx.makeFillContext(execSizeSource);
             final ChunkSource.FillContext sidefc    = ctx.makeFillContext(sideSource);
             final ChunkSource.FillContext opfc      = ctx.makeFillContext(opSource);
+            final Instant timeNow = Instant.now();
 
 
             // Now process the entire added index in chunks of CHUNK_SIZE (2048) rows.
@@ -275,14 +276,12 @@ public class PriceBook {
                 }
 
 
-                final Instant timeNow = Instant.now();
-
                 // Iterate over each row in the processing chunk,  and update the book.
                 for(int ii = 0; ii< nextKeys.size(); ii++) {
                     // Get some minimal data
                     final long ordId = ctx.idChunk.get(ii);
                     final int op = ctx.opChunk.get(ii);
-                    final int size = ctx.sizeChunk.get(ii);
+
 
 
                     /* Order book building logic
@@ -306,6 +305,7 @@ public class PriceBook {
                                 final long timestamp = ctx.timeChunk.get(ii);
                                 final double price = ctx.priceChunk.get(ii);
                                 final int side = ctx.sideChunk.get(ii);
+                                final int size = ctx.sizeChunk.get(ii);
 
                                 this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
 
@@ -317,8 +317,17 @@ public class PriceBook {
                         case OP_INF -> {
                             final long existingOrderRow = orderMap.get(ordId);
                             final int execSize = ctx.execSizeChunk.get(ii);
+
                             if (existingOrderRow != -1) {
-                                this.modifyOrder(ctx, execSize, existingOrderRow, false);
+                                // Should I pass this into modifyOrder?
+                                int currSize = sizeResults.get(existingOrderRow);
+
+                                // If size is down to 0, get rid of it
+                                if (currSize - execSize == 0) {
+                                    this.removeOrder(ctx, ordId);
+                                } else {
+                                    this.modifyOrder(ctx, execSize, existingOrderRow, false, timeNow);
+                                }
                             }
                         }
 
@@ -327,6 +336,7 @@ public class PriceBook {
                         case OP_CRAK -> {
                             final long prevOrderId = ctx.prevIdChunk.get(ii);
                             final long existingOrderRow = orderMap.get(ordId);
+                            final int size = ctx.sizeChunk.get(ii);
 
                             // We will replace the old order with a new one
                             if ( prevOrderId != 0) {
@@ -338,12 +348,13 @@ public class PriceBook {
                                     final double price = ctx.priceChunk.get(ii);
                                     final int side = ctx.sideChunk.get(ii);
 
+
                                     this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
                                 }
 
                             } else {
                                 if (existingOrderRow != -1) {
-                                    this.modifyOrder(ctx, size, existingOrderRow, true);
+                                    this.modifyOrder(ctx, size, existingOrderRow, true, timeNow);
                                 }
                             }
                         }
@@ -387,8 +398,10 @@ public class PriceBook {
 
             // Only add to added RowSet if this rowI was not removed in this cycle
             // otherwise just remove from removed.
+            // A remove followed by an add is a mod.
             if (ctx.rowsRemoved.find(rowOfAdded) >= 0) {
                 ctx.rowsRemoved.remove(rowOfAdded);
+                ctx.rowsModified.insert(rowOfAdded);
             } else {
                 ctx.rowsAdded.insert(rowOfAdded);
             }
@@ -409,7 +422,6 @@ public class PriceBook {
             ctx.rowsAdded.insert(rowOfAdded);
 
         }
-
 
         //Add map from id to row num
         orderMap.put(orderId, rowOfAdded);
@@ -456,7 +468,7 @@ public class PriceBook {
      * @param replace whether to replace or subtract the size from the original size
      *
      */
-    private void modifyOrder(Context ctx, int size, long orderRow, boolean replace) {
+    private void modifyOrder(Context ctx, int size, long orderRow, boolean replace, Instant timeNow) {
 
         if (replace) {
             sizeResults.set(orderRow, size);
@@ -465,6 +477,7 @@ public class PriceBook {
             int currSize = sizeResults.get(orderRow);
             sizeResults.set(orderRow, currSize - size);
         }
+        updateTimeResults.set(orderRow, timeNow);
 
         // Only add to mods if this rowI was not already added this cycle
         // If this row was added in this cycle, then this mod should be considered just an add (do nothing)
@@ -537,10 +550,6 @@ public class PriceBook {
             execSizeChunk.close();
             sideChunk.close();
             opChunk.close();
-
-//            rowsAdded.close();
-//            rowsRemoved.close();
-//            rowsModified.close();
         }
 
         /**
@@ -574,12 +583,7 @@ public class PriceBook {
 
         @Override
         public void run() {
-            // The Update Graph Processor will invoke this at the beginning of each cycle.  This lets the Book produce
-            // an update to blink rows out, even if the upstream recorder did not produce any updates.
-            // Without this,  we will violate Blink semantics by leaving the previous rows beyond the previous cycle.
-            if (!result.isEmpty()) {
-                notifyChanges();
-            }
+            notifyChanges();
         }
 
         @Override
@@ -597,11 +601,6 @@ public class PriceBook {
             return getUpdateGraph().satisfied(step) && recorder.satisfied(step);
         }
 
-        /**
-         * Process an upstream update.  We only support added rows at this point, as handling removals and updates
-         * would be very difficult to handle correctly with the book state.
-         *
-         */
         @Override
         public void process() {
             TableUpdateImpl resultUpdate = new TableUpdateImpl();
@@ -623,8 +622,7 @@ public class PriceBook {
                 if (resultUpdate.modified.isEmpty()) {
                     resultUpdate.modifiedColumnSet = ModifiedColumnSet.EMPTY;
                 } else {
-//                    Map<String, ColumnSource<?>> modSet = new LinkedHashMap<>();
-//                    modSet.put("Size", sizeResults);
+                    // Ideally make more specific
                     resultUpdate.modifiedColumnSet = ModifiedColumnSet.ALL;
                 }
 
@@ -640,7 +638,7 @@ public class PriceBook {
 
             resultUpdate.shifted = RowSetShiftData.EMPTY;
             resultIndex.update(resultUpdate.added, resultUpdate.removed);
-            System.out.println(printUpdate(resultUpdate));
+//            System.out.println(printUpdate(resultUpdate));
             // Once the rows have been processed then we create update the result index with the new rows and fire an
             // update for any downstream listeners of the result table.
             resultTable.notifyListeners(resultUpdate);
@@ -652,6 +650,10 @@ public class PriceBook {
         final RowSet addedMinusCurrent = update.added().minus(resultIndex);
         final RowSet removedIntersectCurrent = update.removed().intersect(resultIndex);
         final RowSet modifiedMinusCurrent = update.modified().minus(resultIndex);
+
+        final RowSet addedIntersectPrevious = update.added().intersect(resultIndex.copyPrev());
+        final RowSet modifiedMinusPrevious = update.modified().minus(resultIndex.copyPrev());
+
 
         // Everything is messed up for this table, print out the indices in an easy to understand way
         final LogOutput logOutput = new LogOutputStringImpl()
@@ -665,7 +667,10 @@ public class PriceBook {
                 .append(LogOutput::nl).append("\t                shifted=").append(update.shifted().toString())
                 .append(LogOutput::nl).append("\t  removalsMinusPrevious=").append(removalsMinusPrevious)
                 .append(LogOutput::nl).append("\t      addedMinusCurrent=").append(addedMinusCurrent)
-                .append(LogOutput::nl).append("\t   modifiedMinusCurrent=").append(modifiedMinusCurrent);
+                .append(LogOutput::nl).append("\t   modifiedMinusCurrent=").append(modifiedMinusCurrent)
+                .append(LogOutput::nl).append("\tremovedIntersectCurrent=").append(removedIntersectCurrent)
+                .append(LogOutput::nl).append("\t addedIntersectPrevious=").append(addedIntersectPrevious)
+                .append(LogOutput::nl).append("\t  modifiedMinusPrevious=").append(modifiedMinusPrevious);
 
 
 
