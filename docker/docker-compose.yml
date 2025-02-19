@@ -6,8 +6,9 @@ services:
       dockerfile: docker/Dockerfile
     ports:
       - '${DEEPHAVEN_PORT:-20000}:10000'
+      - '5005:5005'
     volumes:
       - ./data:/data
     environment:
       - PYTHONPATH=${PYTHONPATH}:/data/storage/notebooks
-      - START_OPTS=-Xmx40g -DAuthHandlers=io.deephaven.auth.AnonymousAuthenticationHandler
+      - START_OPTS=-Xmx40g -DAuthHandlers=io.deephaven.auth.AnonymousAuthenticationHandler -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005
