@@ -19,18 +19,16 @@ import io.deephaven.engine.table.impl.sources.ObjectArraySource;
 import io.deephaven.engine.table.impl.sources.LongArraySource;
 import io.deephaven.io.log.impl.LogOutputStringImpl;
 import io.deephaven.util.SafeCloseable;
+
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
-
-import io.deephaven.base.Base64;
+import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
 
 import org.jetbrains.annotations.NotNull;
 import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
 
 import java.util.*;
-import java.util.function.BiConsumer;
 
-import static io.deephaven.util.QueryConstants.*;
 
 /**
  * <p>Build a book of current live orders</p>
@@ -56,8 +54,6 @@ import static io.deephaven.util.QueryConstants.*;
  */
 public class PriceBook {
     private static final int CHUNK_SIZE = 2048;
-    private static final int SIDE_BUY = 1;
-    private static final int SIDE_SELL = 2;
 
     private static final int OP_OAK = 1;
     private static final int OP_CC = 2;
@@ -103,7 +99,7 @@ public class PriceBook {
 
     // region Book state objects
     private final Long2LongOpenHashMap orderMap = new Long2LongOpenHashMap();
-    private final LongOpenHashSet  availableRows = new LongOpenHashSet();
+    private LongArrayFIFOQueue  availableRows;
     private long  resultSize;
     // endregion
 
@@ -122,7 +118,10 @@ public class PriceBook {
         final QueryTable source = (QueryTable) table.coalesce();
         this.sourceIsBlink = BlinkTableTools.isBlink(source);
         this.orderMap.defaultReturnValue(-1);
+
+        // Maybe make this configurable
         this.resultSize = 0;
+        this.availableRows = new LongArrayFIFOQueue(16383);
 
 
         // Begin by getting references to the column sources from the input table to process later.
@@ -143,6 +142,7 @@ public class PriceBook {
         // Column for the update time
         updateTimeResults = new InstantArraySource();
         columnSourceMap.put(UPDATE_TIME_NAME, updateTimeResults);
+        updateTimeResults.ensureCapacity(this.resultSize);
 
         // Set output table columns
         ordIdResults        = new LongArraySource();
@@ -361,15 +361,16 @@ public class PriceBook {
                     }
                 }
             }
-            resultUpdate.added = ctx.rowsAdded;
-            resultUpdate.removed = ctx.rowsRemoved;
-            resultUpdate.modified = ctx.rowsModified;
+
+            resultUpdate.added = RowSetFactory.fromKeys(ctx.rowsAdded.toLongArray());
+            resultUpdate.removed = RowSetFactory.fromKeys(ctx.rowsRemoved.toLongArray());
+            resultUpdate.modified = RowSetFactory.fromKeys(ctx.rowsModified.toLongArray());
         }
     }
 
 
     /**
-     * Add the specified order to the book.  If the order was new add it to the bookstate.
+     * Add the specified order to the book.
      *
      * @param ctx the context used to update the removed and added rowsets
      * @param orderId the order id
@@ -390,24 +391,25 @@ public class PriceBook {
                           int side,
                           Instant timeNow) {
         long rowOfAdded;
+        boolean inRemoved;
 
         // Find an open slot or increment the row counter
         if (!availableRows.isEmpty()) {
-            rowOfAdded = availableRows.iterator().nextLong();  // Grab any element
-            availableRows.remove(rowOfAdded);  // Remove it from the set
+            rowOfAdded = availableRows.dequeueLong();  // Grab any element
 
             // Only add to added RowSet if this rowI was not removed in this cycle
             // otherwise just remove from removed.
             // A remove followed by an add is a mod.
-            if (ctx.rowsRemoved.find(rowOfAdded) >= 0) {
-                ctx.rowsRemoved.remove(rowOfAdded);
-                ctx.rowsModified.insert(rowOfAdded);
+
+            // Use diff objects for rowsets? then convert at the end
+            inRemoved = ctx.rowsRemoved.remove(rowOfAdded);
+            if (inRemoved) {
+                ctx.rowsModified.add(rowOfAdded);
             } else {
-                ctx.rowsAdded.insert(rowOfAdded);
+                ctx.rowsAdded.add(rowOfAdded);
             }
 
         } else {
-            // No open spots, so expand the size of the columns
             rowOfAdded = resultSize;
             resultSize++;
 
@@ -419,7 +421,7 @@ public class PriceBook {
             sideResults.ensureCapacity(resultSize);
             updateTimeResults.ensureCapacity(resultSize);
 
-            ctx.rowsAdded.insert(rowOfAdded);
+            ctx.rowsAdded.add(rowOfAdded);
 
         }
 
@@ -444,18 +446,18 @@ public class PriceBook {
      */
     private void removeOrder(Context ctx, long orderId) {
         final long rowOfRemoved = orderMap.remove(orderId);
+        boolean inAdded;
 
         if (rowOfRemoved != -1){
             // Only add to removed rowset if this was not added in this cycle
             // otherwise just remove from added
-            if (ctx.rowsAdded.find(rowOfRemoved) >= 0) {
-                ctx.rowsAdded.remove(rowOfRemoved);
-            } else {
-                ctx.rowsRemoved.insert(rowOfRemoved);
+            inAdded = ctx.rowsAdded.remove(rowOfRemoved);
+            if (!inAdded) {
+                ctx.rowsRemoved.add(rowOfRemoved);
             }
 
             ctx.rowsModified.remove(rowOfRemoved);
-            availableRows.add(rowOfRemoved);
+            availableRows.enqueue(rowOfRemoved);
         }
     }
 
@@ -481,8 +483,8 @@ public class PriceBook {
 
         // Only add to mods if this rowI was not already added this cycle
         // If this row was added in this cycle, then this mod should be considered just an add (do nothing)
-        if (ctx.rowsAdded.find(orderRow) < 0) {
-            ctx.rowsModified.insert(orderRow);
+        if (!ctx.rowsAdded.contains(orderRow)) {
+            ctx.rowsModified.add(orderRow);
         }
     }
 
@@ -515,9 +517,9 @@ public class PriceBook {
 
         // Keep track of rows added, removed, or modified so that the result index can be updated and a downstream
         // update can be fired to anything listening to the result table.
-        WritableRowSet rowsAdded = RowSetFactory.empty();
-        WritableRowSet rowsRemoved = RowSetFactory.empty();
-        WritableRowSet rowsModified = RowSetFactory.empty();
+        LongOpenHashSet rowsAdded = new LongOpenHashSet();
+        LongOpenHashSet rowsRemoved = new LongOpenHashSet();
+        LongOpenHashSet rowsModified = new LongOpenHashSet();
 
         Context() {
             sc = SharedContext.makeSharedContext();
