@@ -335,33 +335,30 @@ public class PriceBook {
                         // If there is no prevOrderId, update the orderId with new size
                         case OP_CRAK -> {
                             final long prevOrderId = ctx.prevIdChunk.get(ii);
-                            final long existingOrderRow = orderMap.get(ordId);
                             final int size = ctx.sizeChunk.get(ii);
+                            final long existingOrderRow = orderMap.get(ordId);
 
-                            // We will replace the old order with a new one
-                            if ( prevOrderId != 0) {
-                                this.removeOrder(ctx, prevOrderId);
+                            boolean isModify = (prevOrderId == 0 && existingOrderRow != -1) || prevOrderId == ordId;
 
-                                if (existingOrderRow == -1) {
-                                    final String sym = ctx.symChunk.get(ii);
-                                    final long timestamp = ctx.timeChunk.get(ii);
-                                    final double price = ctx.priceChunk.get(ii);
-                                    final int side = ctx.sideChunk.get(ii);
-
-
-                                    this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
-                                }
+                            if (isModify) {
+                                this.modifyOrder(ctx, size, existingOrderRow, true, timeNow);
 
                             } else {
-                                if (existingOrderRow != -1) {
-                                    this.modifyOrder(ctx, size, existingOrderRow, true, timeNow);
+                                final String sym = ctx.symChunk.get(ii);
+                                final long timestamp = ctx.timeChunk.get(ii);
+                                final double price = ctx.priceChunk.get(ii);
+                                final int side = ctx.sideChunk.get(ii);
+
+                                this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
+
+                                if (prevOrderId != 0) {
+                                    this.removeOrder(ctx, prevOrderId);
                                 }
                             }
                         }
                     }
                 }
             }
-
             resultUpdate.added = RowSetFactory.fromKeys(ctx.rowsAdded.toLongArray());
             resultUpdate.removed = RowSetFactory.fromKeys(ctx.rowsRemoved.toLongArray());
             resultUpdate.modified = RowSetFactory.fromKeys(ctx.rowsModified.toLongArray());
@@ -397,11 +394,10 @@ public class PriceBook {
         if (!availableRows.isEmpty()) {
             rowOfAdded = availableRows.dequeueLong();  // Grab any element
 
-            // Only add to added RowSet if this rowI was not removed in this cycle
-            // otherwise just remove from removed.
-            // A remove followed by an add is a mod.
-
-            // Use diff objects for rowsets? then convert at the end
+            // Has this rowI been removed in this cycle?
+            // If it was, remove from removed rowset
+            // A remove followed by an add is a mod
+            // Otherwise, just add to added rowset
             inRemoved = ctx.rowsRemoved.remove(rowOfAdded);
             if (inRemoved) {
                 ctx.rowsModified.add(rowOfAdded);
@@ -640,13 +636,13 @@ public class PriceBook {
 
             resultUpdate.shifted = RowSetShiftData.EMPTY;
             resultIndex.update(resultUpdate.added, resultUpdate.removed);
-//            System.out.println(printUpdate(resultUpdate));
             // Once the rows have been processed then we create update the result index with the new rows and fire an
             // update for any downstream listeners of the result table.
             resultTable.notifyListeners(resultUpdate);
         }
     }
 
+    // Helper function to print out an update object for debugging
     private String printUpdate(TableUpdateImpl update) {
         final RowSet removalsMinusPrevious = update.removed().minus(resultIndex.copyPrev());
         final RowSet addedMinusCurrent = update.added().minus(resultIndex);
@@ -673,8 +669,6 @@ public class PriceBook {
                 .append(LogOutput::nl).append("\tremovedIntersectCurrent=").append(removedIntersectCurrent)
                 .append(LogOutput::nl).append("\t addedIntersectPrevious=").append(addedIntersectPrevious)
                 .append(LogOutput::nl).append("\t  modifiedMinusPrevious=").append(modifiedMinusPrevious);
-
-
 
         return logOutput.toString();
     }
