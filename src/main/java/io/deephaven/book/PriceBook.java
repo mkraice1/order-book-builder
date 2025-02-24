@@ -135,6 +135,11 @@ public class PriceBook {
         this.sideSource         = source.getColumnSource(sideColumnName);
         this.opSource           = source.getColumnSource(opColumnName);
 
+        // TODO: Go through passthorugh cols. For each
+        // get col source
+        // create new ArraySource by getting class of source
+        // Put in column source map
+
         // Construct the new column sources and result table.
         final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
 
@@ -142,7 +147,6 @@ public class PriceBook {
         // Column for the update time
         updateTimeResults = new InstantArraySource();
         columnSourceMap.put(UPDATE_TIME_NAME, updateTimeResults);
-        updateTimeResults.ensureCapacity(this.resultSize);
 
         // Set output table columns
         ordIdResults        = new LongArraySource();
@@ -241,6 +245,8 @@ public class PriceBook {
             final ChunkSource.FillContext esizefc   = ctx.makeFillContext(execSizeSource);
             final ChunkSource.FillContext sidefc    = ctx.makeFillContext(sideSource);
             final ChunkSource.FillContext opfc      = ctx.makeFillContext(opSource);
+            // TODO: Array of fill contexts for passthrough. Or map string to fc
+
             final Instant timeNow = Instant.now();
 
 
@@ -262,6 +268,7 @@ public class PriceBook {
                     execSizeSource.fillPrevChunk(esizefc, (WritableChunk<? super Values>) ctx.execSizeChunk, nextKeys);
                     sideSource.fillPrevChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
                     opSource.fillPrevChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
+                    // TODO: do this for all passthrough cols
 
                 } else {
                     ordIdSource.fillChunk(oidfc, (WritableChunk<? super Values>) ctx.idChunk, nextKeys);
@@ -298,7 +305,6 @@ public class PriceBook {
                         case OP_OAK -> {
                             final long existingOrderRow = orderMap.get(ordId);
                             // If the order doesn't already exist, add it
-                            // TODO: Do we care if we try to ack an order already ack'd? Should we complain?
                             if (existingOrderRow == -1) {
                                 // Get rest of order data
                                 final String sym = ctx.symChunk.get(ii);
@@ -306,6 +312,7 @@ public class PriceBook {
                                 final double price = ctx.priceChunk.get(ii);
                                 final int side = ctx.sideChunk.get(ii);
                                 final int size = ctx.sizeChunk.get(ii);
+                                // TODO: passthrough chunk?
 
                                 this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
 
@@ -338,11 +345,12 @@ public class PriceBook {
                             final int size = ctx.sizeChunk.get(ii);
                             final long existingOrderRow = orderMap.get(ordId);
 
-                            boolean isModify = (prevOrderId == 0 && existingOrderRow != -1) || prevOrderId == ordId;
-
-                            if (isModify) {
+                            // If ord_id exists, we only change the qty
+                            if (existingOrderRow != -1) {
                                 this.modifyOrder(ctx, size, existingOrderRow, true, timeNow);
 
+                            // If ord_id doesn't exist, we create a new order and remove the old order
+                            // which has current prev_ord_id as its ord_id.
                             } else {
                                 final String sym = ctx.symChunk.get(ii);
                                 final long timestamp = ctx.timeChunk.get(ii);
@@ -418,7 +426,6 @@ public class PriceBook {
             updateTimeResults.ensureCapacity(resultSize);
 
             ctx.rowsAdded.add(rowOfAdded);
-
         }
 
         //Add map from id to row num
@@ -503,6 +510,7 @@ public class PriceBook {
         final WritableIntChunk<?> execSizeChunk;
         final WritableIntChunk<?> sideChunk;
         final WritableIntChunk<?> opChunk;
+        // Map string to chunk or Array of chunks?
 
         /*
          * The SharedContext and FillContexts are used by the column sources when they copy data into the chunks
