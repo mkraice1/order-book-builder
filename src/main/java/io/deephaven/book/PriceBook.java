@@ -73,13 +73,10 @@ public class PriceBook {
     // region Input Sources
     private final ColumnSource<Long> ordIdSource;
     private final ColumnSource<Long> prevOrderIdSource;
-    private final ColumnSource<Long> orderTimeSource;
-    private final ColumnSource<Double> priceSource;
     private final ColumnSource<Integer> sizeSource;
     private final ColumnSource<Integer> execSizeSource;
-    private final ColumnSource<Integer> sideSource;
     private final ColumnSource<Integer> opSource;
-    private final ColumnSource<String> symSource;
+    private final ColumnSource[] passThroughSources;
     // endregion
 
     // region OutputSources
@@ -89,12 +86,9 @@ public class PriceBook {
     final TrackingWritableRowSet resultIndex;
 
     final InstantArraySource updateTimeResults;
-    final DoubleArraySource priceResults;
-    final InstantArraySource orderTimeResults;
     final IntegerArraySource sizeResults;
-    final IntegerArraySource sideResults;
     final LongArraySource ordIdResults;
-    final ObjectArraySource<String> symResults;
+    final WritableColumnSource[] passThroughResults;
     // endregion
 
     // region Book state objects
@@ -108,16 +102,16 @@ public class PriceBook {
     private PriceBook(@NotNull final Table table,
                       @NotNull String idColumnName,
                       @NotNull String prevIdColumnName,
-                      @NotNull String symColumnName,
-                      @NotNull String timestampColumnName,
-                      @NotNull String priceColumnName,
                       @NotNull String sizeColumnName,
                       @NotNull String execSizeColumnName,
-                      @NotNull String sideColumnName,
-                      @NotNull String opColumnName) {
+                      @NotNull String opColumnName,
+                      String... passThroughCols) {
+
         final QueryTable source = (QueryTable) table.coalesce();
         this.sourceIsBlink = BlinkTableTools.isBlink(source);
         this.orderMap.defaultReturnValue(-1);
+        this.passThroughSources = new ColumnSource[passThroughCols.length];
+        this.passThroughResults = new WritableColumnSource[passThroughCols.length];
 
         // Maybe make this configurable
         this.resultSize = 0;
@@ -127,41 +121,58 @@ public class PriceBook {
         // Begin by getting references to the column sources from the input table to process later.
         this.ordIdSource        = source.getColumnSource(idColumnName);
         this.prevOrderIdSource  = source.getColumnSource(prevIdColumnName);
-        this.symSource          = source.getColumnSource(symColumnName);
-        this.orderTimeSource    = ReinterpretUtils.instantToLongSource(source.getColumnSource(timestampColumnName));
-        this.priceSource        = source.getColumnSource(priceColumnName);
         this.sizeSource         = source.getColumnSource(sizeColumnName);
         this.execSizeSource     = source.getColumnSource(execSizeColumnName);
-        this.sideSource         = source.getColumnSource(sideColumnName);
         this.opSource           = source.getColumnSource(opColumnName);
 
-        // TODO: Go through passthorugh cols. For each
-        // get col source
-        // create new ArraySource by getting class of source
-        // Put in column source map
 
         // Construct the new column sources and result table.
         final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
 
-        // Now we create the columns which will be in the output table.
-        // Column for the update time
+        // Required output table columns
         updateTimeResults = new InstantArraySource();
-        columnSourceMap.put(UPDATE_TIME_NAME, updateTimeResults);
-
-        // Set output table columns
         ordIdResults        = new LongArraySource();
-        symResults          = new ObjectArraySource(String.class);
-        orderTimeResults    = new InstantArraySource();
-        priceResults        = new DoubleArraySource();
         sizeResults         = new IntegerArraySource();
-        sideResults         = new IntegerArraySource();
 
+        columnSourceMap.put(UPDATE_TIME_NAME, updateTimeResults);
         columnSourceMap.put(ORDID_NAME, ordIdResults);
-        columnSourceMap.put(SYM_NAME, symResults);
-        columnSourceMap.put(ORD_TIME_NAME, orderTimeResults);
-        columnSourceMap.put(PRC_NAME, priceResults);
         columnSourceMap.put(SIZE_NAME, sizeResults);
-        columnSourceMap.put(SIDE_NAME, sideResults);
+
+        // Add in the pass through column sources
+        for(int ii = 0; ii < passThroughCols.length; ii++) {
+            final String passColName = passThroughCols[ii];
+            ColumnSource passColInputSource = source.getColumnSource(passColName);
+            WritableColumnSource passColResultSource;
+            String colType = passColInputSource.getType().toString();
+
+            switch (colType) {
+                case "class java.time.Instant":
+                    passColInputSource = ReinterpretUtils.instantToLongSource(passColInputSource);
+                    passColResultSource = new InstantArraySource();
+                    break;
+
+                case "class java.lang.String": passColResultSource = new ObjectArraySource(String.class);
+                    break;
+
+                case "long": passColResultSource = new LongArraySource();
+                    break;
+
+                case "double": passColResultSource = new DoubleArraySource();
+                    break;
+
+                case "int": passColResultSource = new IntegerArraySource();
+                    break;
+
+                default: throw new IllegalArgumentException(passColName + " is an invalid input column type: " + colType);
+            }
+
+            // Add to pass through sources
+            // Add to results for writing to later
+            // Add to columnMap for constructing the results table.
+            this.passThroughSources[ii] = passColInputSource;
+            this.passThroughResults[ii] = passColResultSource;
+            columnSourceMap.put(passColName, this.passThroughResults[ii]);
+        }
 
         // Finally, create the result table for the user
         final OperationSnapshotControl snapshotControl =
@@ -230,7 +241,7 @@ public class PriceBook {
     @SuppressWarnings("unchecked")
     private void processAdded(RowSet added, boolean usePrev, TableUpdateImpl resultUpdate) {
         // First create the context object in a try-with-resources so it gets automatically cleaned up when we're done.
-        try(final Context ctx = new Context()) {
+        try(final Context ctx = new Context(this.passThroughSources)) {
             // Next we get an iterator into the added index so that we can process the update in chunks.
             final RowSequence.Iterator okit = added.getRowSequenceIterator();
 
@@ -238,17 +249,14 @@ public class PriceBook {
             // a fill context for each column we'll be copying
             final ChunkSource.FillContext oidfc     = ctx.makeFillContext(ordIdSource);
             final ChunkSource.FillContext poidfc    = ctx.makeFillContext(prevOrderIdSource);
-            final ChunkSource.FillContext symfc     = ctx.makeFillContext(symSource);
-            final ChunkSource.FillContext timefc    = ctx.makeFillContext(orderTimeSource);
-            final ChunkSource.FillContext pricefc   = ctx.makeFillContext(priceSource);
             final ChunkSource.FillContext sizefc    = ctx.makeFillContext(sizeSource);
             final ChunkSource.FillContext esizefc   = ctx.makeFillContext(execSizeSource);
-            final ChunkSource.FillContext sidefc    = ctx.makeFillContext(sideSource);
             final ChunkSource.FillContext opfc      = ctx.makeFillContext(opSource);
-            // TODO: Array of fill contexts for passthrough. Or map string to fc
+            // fc for pass through cols
+            ChunkSource.FillContext[] passfcs = new ChunkSource.FillContext[this.passThroughSources.length];
+            Arrays.stream(this.passThroughSources).map(colSource -> ctx.makeFillContext(colSource));
 
             final Instant timeNow = Instant.now();
-
 
             // Now process the entire added index in chunks of CHUNK_SIZE (2048) rows.
             while(okit.hasMore()) {
@@ -261,34 +269,31 @@ public class PriceBook {
                 if(usePrev) {
                     ordIdSource.fillPrevChunk(oidfc, (WritableChunk<? super Values>) ctx.idChunk, nextKeys);
                     prevOrderIdSource.fillPrevChunk(poidfc, (WritableChunk<? super Values>) ctx.prevIdChunk, nextKeys);
-                    symSource.fillPrevChunk(symfc, (WritableChunk<? super Values>) ctx.symChunk, nextKeys);
-                    orderTimeSource.fillPrevChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
-                    priceSource.fillPrevChunk(pricefc, (WritableChunk<? super Values>) ctx.priceChunk, nextKeys);
                     sizeSource.fillPrevChunk(sizefc, (WritableChunk<? super Values>) ctx.sizeChunk, nextKeys);
                     execSizeSource.fillPrevChunk(esizefc, (WritableChunk<? super Values>) ctx.execSizeChunk, nextKeys);
-                    sideSource.fillPrevChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
                     opSource.fillPrevChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
-                    // TODO: do this for all passthrough cols
+
+                    for(int ii = 0; ii < passThroughSources.length; ii++) {
+                        this.passThroughSources[ii].fillPrevChunk(opfc, (WritableChunk<? super Values>) ctx.passChunks[ii], nextKeys);
+                    }
 
                 } else {
                     ordIdSource.fillChunk(oidfc, (WritableChunk<? super Values>) ctx.idChunk, nextKeys);
                     prevOrderIdSource.fillChunk(poidfc, (WritableChunk<? super Values>) ctx.prevIdChunk, nextKeys);
-                    symSource.fillChunk(symfc, (WritableChunk<? super Values>) ctx.symChunk, nextKeys);
-                    orderTimeSource.fillChunk(timefc, (WritableChunk<? super Values>) ctx.timeChunk, nextKeys);
-                    priceSource.fillChunk(pricefc, (WritableChunk<? super Values>) ctx.priceChunk, nextKeys);
                     sizeSource.fillChunk(sizefc, (WritableChunk<? super Values>) ctx.sizeChunk, nextKeys);
                     execSizeSource.fillChunk(esizefc, (WritableChunk<? super Values>) ctx.execSizeChunk, nextKeys);
-                    sideSource.fillChunk(sidefc, (WritableChunk<? super Values>) ctx.sideChunk, nextKeys);
                     opSource.fillChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
+
+                    for(int ii = 0; ii < passThroughSources.length; ii++) {
+                        this.passThroughSources[ii].fillChunk(opfc, (WritableChunk<? super Values>) ctx.passChunks[ii], nextKeys);
+                    }
                 }
 
-
-                // Iterate over each row in the processing chunk,  and update the book.
-                for(int ii = 0; ii< nextKeys.size(); ii++) {
+                // Iterate over each row in the processing chunk, and update the book.
+                for(int chunkI = 0; chunkI< nextKeys.size(); chunkI++) {
                     // Get some minimal data
-                    final long ordId = ctx.idChunk.get(ii);
-                    final int op = ctx.opChunk.get(ii);
-
+                    final long ordId = ctx.idChunk.get(chunkI);
+                    final int op = ctx.opChunk.get(chunkI);
 
 
                     /* Order book building logic
@@ -307,15 +312,9 @@ public class PriceBook {
                             // If the order doesn't already exist, add it
                             if (existingOrderRow == -1) {
                                 // Get rest of order data
-                                final String sym = ctx.symChunk.get(ii);
-                                final long timestamp = ctx.timeChunk.get(ii);
-                                final double price = ctx.priceChunk.get(ii);
-                                final int side = ctx.sideChunk.get(ii);
-                                final int size = ctx.sizeChunk.get(ii);
-                                // TODO: passthrough chunk?
+                                final int size = ctx.sizeChunk.get(chunkI);
 
-                                this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
-
+                                this.addOrder(ctx, ordId, size, timeNow, chunkI);
                             }
                         }
 
@@ -323,7 +322,7 @@ public class PriceBook {
 
                         case OP_INF -> {
                             final long existingOrderRow = orderMap.get(ordId);
-                            final int execSize = ctx.execSizeChunk.get(ii);
+                            final int execSize = ctx.execSizeChunk.get(chunkI);
 
                             if (existingOrderRow != -1) {
                                 // Should I pass this into modifyOrder?
@@ -341,8 +340,8 @@ public class PriceBook {
                         // Remove the prevOrderId if there is one and add the orderId.
                         // If there is no prevOrderId, update the orderId with new size
                         case OP_CRAK -> {
-                            final long prevOrderId = ctx.prevIdChunk.get(ii);
-                            final int size = ctx.sizeChunk.get(ii);
+                            final long prevOrderId = ctx.prevIdChunk.get(chunkI);
+                            final int size = ctx.sizeChunk.get(chunkI);
                             final long existingOrderRow = orderMap.get(ordId);
 
                             // If ord_id exists, we only change the qty
@@ -352,12 +351,8 @@ public class PriceBook {
                             // If ord_id doesn't exist, we create a new order and remove the old order
                             // which has current prev_ord_id as its ord_id.
                             } else {
-                                final String sym = ctx.symChunk.get(ii);
-                                final long timestamp = ctx.timeChunk.get(ii);
-                                final double price = ctx.priceChunk.get(ii);
-                                final int side = ctx.sideChunk.get(ii);
 
-                                this.addOrder(ctx, ordId, sym, timestamp, price, size, side, timeNow);
+                                this.addOrder(ctx, ordId, size, timeNow, chunkI);
 
                                 if (prevOrderId != 0) {
                                     this.removeOrder(ctx, prevOrderId);
@@ -379,22 +374,15 @@ public class PriceBook {
      *
      * @param ctx the context used to update the removed and added rowsets
      * @param orderId the order id
-     * @param sym the symbol of the order
-     * @param time the timestamp of the order
-     * @param price the price of the order
      * @param size the size of the order
-     * @param side the side of the order
      * @param timeNow the time the order is updated in the book
      *
      */
     private void addOrder(Context ctx,
                           long orderId,
-                          String sym,
-                          long time,
-                          double price,
                           int size,
-                          int side,
-                          Instant timeNow) {
+                          Instant timeNow,
+                          int chunkI) {
         long rowOfAdded;
         boolean inRemoved;
 
@@ -418,12 +406,13 @@ public class PriceBook {
             resultSize++;
 
             ordIdResults.ensureCapacity(resultSize);
-            symResults.ensureCapacity(resultSize);
-            orderTimeResults.ensureCapacity(resultSize);
-            priceResults.ensureCapacity(resultSize);
             sizeResults.ensureCapacity(resultSize);
-            sideResults.ensureCapacity(resultSize);
             updateTimeResults.ensureCapacity(resultSize);
+
+            for(int ii = 0; ii < passThroughResults.length; ii++) {
+                this.passThroughResults[ii].ensureCapacity(resultSize);
+            }
+
 
             ctx.rowsAdded.add(rowOfAdded);
         }
@@ -432,12 +421,36 @@ public class PriceBook {
         orderMap.put(orderId, rowOfAdded);
 
         ordIdResults.set(rowOfAdded, orderId);
-        symResults.set(rowOfAdded, sym);
-        orderTimeResults.set(rowOfAdded, time);
-        priceResults.set(rowOfAdded, price);
         sizeResults.set(rowOfAdded, size);
-        sideResults.set(rowOfAdded, side);
         updateTimeResults.set(rowOfAdded, timeNow);
+
+        for(int ii = 0; ii < passThroughResults.length; ii++) {
+            ColumnSource passColSource = passThroughSources[ii];
+
+            String colType = passColSource.getType().toString();
+
+            switch (colType) {
+                case "class java.time.Instant":
+                case "long":
+                    this.passThroughResults[ii].set(rowOfAdded, ((WritableLongChunk) ctx.passChunks[ii]).get(chunkI));
+                    break;
+
+                case "class java.lang.String":
+                    this.passThroughResults[ii].set(rowOfAdded, ((WritableObjectChunk<String, ?>) ctx.passChunks[ii]).get(chunkI));
+                    break;
+
+                case "double":
+                    this.passThroughResults[ii].set(rowOfAdded, ((WritableDoubleChunk) ctx.passChunks[ii]).get(chunkI));
+                    break;
+
+                case "int":
+                    this.passThroughResults[ii].set(rowOfAdded, ((WritableIntChunk) ctx.passChunks[ii]).get(chunkI));
+                    break;
+
+                default:
+                    throw new IllegalArgumentException("Invalid input column type: " + colType);
+            }
+        }
     }
 
     /**
@@ -503,14 +516,12 @@ public class PriceBook {
          */
         final WritableLongChunk<?> idChunk;
         final WritableLongChunk<?> prevIdChunk;
-        final WritableObjectChunk<String, ?> symChunk;
-        final WritableLongChunk<?> timeChunk;
-        final WritableDoubleChunk<?> priceChunk;
         final WritableIntChunk<?> sizeChunk;
         final WritableIntChunk<?> execSizeChunk;
-        final WritableIntChunk<?> sideChunk;
         final WritableIntChunk<?> opChunk;
         // Map string to chunk or Array of chunks?
+
+        WritableChunk[] passChunks;
 
         /*
          * The SharedContext and FillContexts are used by the column sources when they copy data into the chunks
@@ -525,18 +536,45 @@ public class PriceBook {
         LongOpenHashSet rowsRemoved = new LongOpenHashSet();
         LongOpenHashSet rowsModified = new LongOpenHashSet();
 
-        Context() {
+        Context(ColumnSource[] passThroughSources) {
             sc = SharedContext.makeSharedContext();
 
             idChunk         = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
             prevIdChunk     = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
-            symChunk        = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
-            timeChunk       = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
-            priceChunk      = WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
             sizeChunk       = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
             execSizeChunk   = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
-            sideChunk       = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
             opChunk         = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+
+            passChunks = new WritableChunk[passThroughSources.length];
+
+            // Add in the pass through column sources
+            for(int ii = 0; ii < passThroughSources.length; ii++) {
+                ColumnSource passColSource = passThroughSources[ii];
+
+                String colType = passColSource.getType().toString();
+
+                switch (colType) {
+                    case "class java.time.Instant":
+                    case "long":
+                        passChunks[ii] = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+                        break;
+
+                    case "class java.lang.String":
+                        passChunks[ii] = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+                        break;
+
+                    case "double":
+                        passChunks[ii] =WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
+                        break;
+
+                    case "int":
+                        passChunks[ii] = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+                        break;
+
+                    default:
+                        throw new IllegalArgumentException("Invalid input column type: " + colType);
+                }
+            }
         }
 
         /**
@@ -547,14 +585,11 @@ public class PriceBook {
         public void close() {
             sc.close();
             fillContexts.forEach(ChunkSource.FillContext::close);
+            Arrays.stream(passChunks).forEach(SafeCloseable::close);
             idChunk.close();
             prevIdChunk.close();
-            symChunk.close();
-            timeChunk.close();
-            priceChunk.close();
             sizeChunk.close();
             execSizeChunk.close();
-            sideChunk.close();
             opChunk.close();
         }
 
@@ -686,11 +721,7 @@ public class PriceBook {
      *
      * @param source the table with the source data
      * @param idColumnName the name of the source order id column
-     * @param symColumnName the name of the source order symbol column
-     * @param timestampColumnName the name of the source timestamp column
-     * @param priceColumnName the name of the source price column
      * @param sizeColumnName the name of the source size column
-     * @param sideColumnName the name of the source side column
      * @param opColumnName the name of the source book-op column
      *
      * @return a new table representing the current state of the book.  This table will update as the source table updates.
@@ -699,24 +730,18 @@ public class PriceBook {
     public static QueryTable build(@NotNull Table source,
                                    @NotNull String idColumnName,
                                    @NotNull String prevIdColumnName,
-                                   @NotNull String symColumnName,
-                                   @NotNull String timestampColumnName,
-                                   @NotNull String priceColumnName,
                                    @NotNull String sizeColumnName,
                                    @NotNull String execSizeColumnName,
-                                   @NotNull String sideColumnName,
-                                   @NotNull String opColumnName
+                                   @NotNull String opColumnName,
+                                   @NotNull String... passThroughCols
                                    ) {
         final PriceBook book = new PriceBook(source,
                 idColumnName,
                 prevIdColumnName,
-                symColumnName,
-                timestampColumnName,
-                priceColumnName,
                 sizeColumnName,
                 execSizeColumnName,
-                sideColumnName,
-                opColumnName);
+                opColumnName,
+                passThroughCols);
 
         return book.resultTable;
     }
