@@ -89,6 +89,7 @@ public class PriceBook {
     final IntegerArraySource sizeResults;
     final LongArraySource ordIdResults;
     final WritableColumnSource[] passThroughResults;
+    final Class<?>[] passThroughClasses;
     // endregion
 
     // region Book state objects
@@ -112,6 +113,7 @@ public class PriceBook {
         this.orderMap.defaultReturnValue(-1);
         this.passThroughSources = new ColumnSource[passThroughCols.length];
         this.passThroughResults = new WritableColumnSource[passThroughCols.length];
+        this.passThroughClasses = new Class<?>[passThroughCols.length];
 
         // Maybe make this configurable
         this.resultSize = 0;
@@ -142,33 +144,35 @@ public class PriceBook {
         for(int ii = 0; ii < passThroughCols.length; ii++) {
             final String passColName = passThroughCols[ii];
             ColumnSource passColInputSource = source.getColumnSource(passColName);
-            WritableColumnSource passColResultSource;
-            String colType = passColInputSource.getType().toString();
+            WritableColumnSource<?> passColResultSource;
 
-            switch (colType) {
-                case "class java.time.Instant":
-                    passColInputSource = ReinterpretUtils.instantToLongSource(passColInputSource);
-                    passColResultSource = new InstantArraySource();
-                    break;
+            Class<?> colType = passColInputSource.getType();
 
-                case "class java.lang.String": passColResultSource = new ObjectArraySource(String.class);
-                    break;
+            if (colType == Instant.class) {
+                passColInputSource = ReinterpretUtils.instantToLongSource(passColInputSource);
+                passColResultSource = new InstantArraySource();
 
-                case "long": passColResultSource = new LongArraySource();
-                    break;
+            } else if (colType == long.class) {
+                passColResultSource = new LongArraySource();
 
-                case "double": passColResultSource = new DoubleArraySource();
-                    break;
+            } else if (colType == String.class){
+                passColResultSource = new ObjectArraySource(String.class);
 
-                case "int": passColResultSource = new IntegerArraySource();
-                    break;
+            } else if (colType == double.class) {
+                passColResultSource = new DoubleArraySource();
 
-                default: throw new IllegalArgumentException(passColName + " is an invalid input column type: " + colType);
+            } else if (colType == int.class) {
+                passColResultSource = new IntegerArraySource();
+
+            } else {
+                throw new IllegalArgumentException(passColName + " is an invalid input column type: " + colType);
             }
 
+            // Save the class for reference later
             // Add to pass through sources
             // Add to results for writing to later
             // Add to columnMap for constructing the results table.
+            this.passThroughClasses[ii] = colType;
             this.passThroughSources[ii] = passColInputSource;
             this.passThroughResults[ii] = passColResultSource;
             columnSourceMap.put(passColName, this.passThroughResults[ii]);
@@ -241,7 +245,7 @@ public class PriceBook {
     @SuppressWarnings("unchecked")
     private void processAdded(RowSet added, boolean usePrev, TableUpdateImpl resultUpdate) {
         // First create the context object in a try-with-resources so it gets automatically cleaned up when we're done.
-        try(final Context ctx = new Context(this.passThroughSources)) {
+        try(final Context ctx = new Context(this.passThroughClasses)) {
             // Next we get an iterator into the added index so that we can process the update in chunks.
             final RowSequence.Iterator okit = added.getRowSequenceIterator();
 
@@ -274,9 +278,8 @@ public class PriceBook {
                     opSource.fillPrevChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
 
                     for(int ii = 0; ii < passThroughSources.length; ii++) {
-                        this.passThroughSources[ii].fillPrevChunk(opfc, (WritableChunk<? super Values>) ctx.passChunks[ii], nextKeys);
+                        this.passThroughSources[ii].fillPrevChunk(passfcs[ii], (WritableChunk<? super Values>) ctx.passChunks[ii], nextKeys);
                     }
-
                 } else {
                     ordIdSource.fillChunk(oidfc, (WritableChunk<? super Values>) ctx.idChunk, nextKeys);
                     prevOrderIdSource.fillChunk(poidfc, (WritableChunk<? super Values>) ctx.prevIdChunk, nextKeys);
@@ -285,7 +288,7 @@ public class PriceBook {
                     opSource.fillChunk(opfc, (WritableChunk<? super Values>) ctx.opChunk, nextKeys);
 
                     for(int ii = 0; ii < passThroughSources.length; ii++) {
-                        this.passThroughSources[ii].fillChunk(opfc, (WritableChunk<? super Values>) ctx.passChunks[ii], nextKeys);
+                        this.passThroughSources[ii].fillChunk(passfcs[ii], (WritableChunk<? super Values>) ctx.passChunks[ii], nextKeys);
                     }
                 }
 
@@ -425,30 +428,22 @@ public class PriceBook {
         updateTimeResults.set(rowOfAdded, timeNow);
 
         for(int ii = 0; ii < passThroughResults.length; ii++) {
-            ColumnSource passColSource = passThroughSources[ii];
+            Class<?> colType = this.passThroughClasses[ii];
 
-            String colType = passColSource.getType().toString();
+            if (colType == Instant.class || colType == long.class) {
+                this.passThroughResults[ii].set(rowOfAdded, ((WritableLongChunk) ctx.passChunks[ii]).get(chunkI));
 
-            switch (colType) {
-                case "class java.time.Instant":
-                case "long":
-                    this.passThroughResults[ii].set(rowOfAdded, ((WritableLongChunk) ctx.passChunks[ii]).get(chunkI));
-                    break;
+            } else if (colType == String.class){
+                this.passThroughResults[ii].set(rowOfAdded, ((WritableObjectChunk<String, ?>) ctx.passChunks[ii]).get(chunkI));
 
-                case "class java.lang.String":
-                    this.passThroughResults[ii].set(rowOfAdded, ((WritableObjectChunk<String, ?>) ctx.passChunks[ii]).get(chunkI));
-                    break;
+            } else if (colType == double.class) {
+                this.passThroughResults[ii].set(rowOfAdded, ((WritableDoubleChunk) ctx.passChunks[ii]).get(chunkI));
 
-                case "double":
-                    this.passThroughResults[ii].set(rowOfAdded, ((WritableDoubleChunk) ctx.passChunks[ii]).get(chunkI));
-                    break;
+            } else if (colType == int.class) {
+                this.passThroughResults[ii].set(rowOfAdded, ((WritableIntChunk) ctx.passChunks[ii]).get(chunkI));
 
-                case "int":
-                    this.passThroughResults[ii].set(rowOfAdded, ((WritableIntChunk) ctx.passChunks[ii]).get(chunkI));
-                    break;
-
-                default:
-                    throw new IllegalArgumentException("Invalid input column type: " + colType);
+            } else {
+                throw new IllegalArgumentException("Invalid input column type: " + colType);
             }
         }
     }
@@ -536,7 +531,7 @@ public class PriceBook {
         LongOpenHashSet rowsRemoved = new LongOpenHashSet();
         LongOpenHashSet rowsModified = new LongOpenHashSet();
 
-        Context(ColumnSource[] passThroughSources) {
+        Context(Class<?>[] passThroughClasses) {
             sc = SharedContext.makeSharedContext();
 
             idChunk         = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
@@ -545,34 +540,26 @@ public class PriceBook {
             execSizeChunk   = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
             opChunk         = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
 
-            passChunks = new WritableChunk[passThroughSources.length];
+            passChunks = new WritableChunk[passThroughClasses.length];
 
             // Add in the pass through column sources
-            for(int ii = 0; ii < passThroughSources.length; ii++) {
-                ColumnSource passColSource = passThroughSources[ii];
+            for(int ii = 0; ii < passThroughClasses.length; ii++) {
+                Class<?> colType = passThroughClasses[ii];
 
-                String colType = passColSource.getType().toString();
+                if (colType == Instant.class || colType == long.class) {
+                    passChunks[ii] = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
 
-                switch (colType) {
-                    case "class java.time.Instant":
-                    case "long":
-                        passChunks[ii] = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
-                        break;
+                } else if (colType == String.class){
+                    passChunks[ii] = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
 
-                    case "class java.lang.String":
-                        passChunks[ii] = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
-                        break;
+                } else if (colType == double.class) {
+                    passChunks[ii] =WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
 
-                    case "double":
-                        passChunks[ii] =WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
-                        break;
+                } else if (colType == int.class) {
+                    passChunks[ii] = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
 
-                    case "int":
-                        passChunks[ii] = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
-                        break;
-
-                    default:
-                        throw new IllegalArgumentException("Invalid input column type: " + colType);
+                } else {
+                    throw new IllegalArgumentException("Invalid input column type: " + colType);
                 }
             }
         }
