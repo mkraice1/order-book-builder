@@ -1,8 +1,5 @@
 package io.deephaven.book;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.ObjectOutputStream;
 import java.lang.String;
 import java.time.Instant;
 
@@ -34,7 +31,7 @@ import java.util.*;
  * <p>Build a book of current live orders</p>
  * <p>
  *     Creating a price book is as simple as invoking the static build method, specifying the column names of
- *     your source table.
+ *     your source table. There are 5 required columns and the rest will be passed through.
  *
  *      <pre>{@code
  *      import io.deephaven.book.PriceBook
@@ -43,13 +40,14 @@ import java.util.*;
  *                      .where("Date=`2021-01-13`", "Time > '2021-01-13T08:30:00 NY'")
  *                      .sort("Time")
  *
- *      book = PriceBook.build(orderStream,"ORD_ID", "PREV_ORD_ID", "SYMB", "EPOCH_TS",  "PRC",
- *                "QTY", "EXEC_QTY", "SIDE", "EVT_ID")
+ *      book = PriceBook.build(orderStream,"ORD_ID", "PREV_ORD_ID", "QTY", "EXEC_QTY", "EVT_ID",
+ *          "PassCol1", "PassCol2"...)
  *
  *      }</pre>
  *
  * <p></p>
  * <p>
+ *
  *
  */
 public class PriceBook {
@@ -63,12 +61,7 @@ public class PriceBook {
     // Names of the output table columns
     private static final String UPDATE_TIME_NAME = "UpdateTimestamp";
     private static final String ORDID_NAME = "OrderId";
-    private static final String SYM_NAME = "Symbol";
-    private static final String ORD_TIME_NAME = "OrderTimestamp";
-    private static final String PRC_NAME = "Price";
     private static final String SIZE_NAME = "Size";
-    private static final String SIDE_NAME = "Side";
-
 
     // region Input Sources
     private final ColumnSource<Long> ordIdSource;
@@ -76,7 +69,7 @@ public class PriceBook {
     private final ColumnSource<Integer> sizeSource;
     private final ColumnSource<Integer> execSizeSource;
     private final ColumnSource<Integer> opSource;
-    private final ColumnSource[] passThroughSources;
+    private final ColumnSource<?>[] passThroughSources;
     // endregion
 
     // region OutputSources
@@ -90,17 +83,19 @@ public class PriceBook {
     final LongArraySource ordIdResults;
     final WritableColumnSource[] passThroughResults;
     final Class<?>[] passThroughClasses;
+    final String[] passThroughColNames;
     // endregion
 
     // region Book state objects
     private final Long2LongOpenHashMap orderMap = new Long2LongOpenHashMap();
-    private LongArrayFIFOQueue  availableRows;
+    private final LongArrayFIFOQueue  availableRows;
     private long  resultSize;
     // endregion
 
     private final boolean sourceIsBlink;
 
     private PriceBook(@NotNull final Table table,
+                      final Table snapshot,
                       @NotNull String idColumnName,
                       @NotNull String prevIdColumnName,
                       @NotNull String sizeColumnName,
@@ -114,6 +109,7 @@ public class PriceBook {
         this.passThroughSources = new ColumnSource[passThroughCols.length];
         this.passThroughResults = new WritableColumnSource[passThroughCols.length];
         this.passThroughClasses = new Class<?>[passThroughCols.length];
+        this.passThroughColNames = passThroughCols;
 
         // Maybe make this configurable
         this.resultSize = 0;
@@ -132,7 +128,7 @@ public class PriceBook {
         final Map<String, ColumnSource<?>> columnSourceMap = new LinkedHashMap<>();
 
         // Required output table columns
-        updateTimeResults = new InstantArraySource();
+        updateTimeResults   = new InstantArraySource();
         ordIdResults        = new LongArraySource();
         sizeResults         = new IntegerArraySource();
 
@@ -184,6 +180,21 @@ public class PriceBook {
 
         final MutableObject<QueryTable> result = new MutableObject<>();
         final MutableObject<BookListener> listenerHolder = new MutableObject<>();
+        final WritableRowSet snapAdded;
+
+        if (snapshot != null) {
+
+            if (!this.verifySnapshot(snapshot, columnSourceMap)) {
+                throw new IllegalArgumentException("Snapshot schema does not match output schema");
+            }
+            // Process the snapshot first
+            TableUpdateImpl resultUpdate = new TableUpdateImpl();
+            processInitBook(snapshot, resultUpdate);
+            snapAdded = (WritableRowSet) resultUpdate.added;
+        } else {
+            snapAdded = RowSetFactory.empty();
+        }
+
         QueryTable.initializeWithSnapshot("bookBuilder", snapshotControl,
                 (prevRequested, beforeClock) -> {
                     final boolean usePrev = prevRequested && source.isRefreshing();
@@ -191,10 +202,11 @@ public class PriceBook {
                     // Initialize the internal state by processing the entire input table.  This will be done asynchronously from
                     // the LTM thread and so it must know if it should use previous values or current values.
 
-                    TableUpdateImpl resultUpdate = new TableUpdateImpl();
+                    final TableUpdateImpl resultUpdate = new TableUpdateImpl();
                     processAdded(usePrev ? source.getRowSet().prev() : source.getRowSet(), usePrev, resultUpdate);
 
-                    WritableRowSet resultRows = (WritableRowSet) resultUpdate.added;
+                    final WritableRowSet resultRows = (WritableRowSet) resultUpdate.added;
+                    resultRows.insert(snapAdded);
                     resultRows.remove(resultUpdate.removed);
 
                     final QueryTable bookTable = new QueryTable( (resultRows).toTracking(), columnSourceMap);
@@ -233,6 +245,21 @@ public class PriceBook {
         }
     }
 
+    private boolean verifySnapshot(Table snapshot, Map<String, ColumnSource<?>> resultSourceMap) {
+        Map<String, ColumnSource<?>> snapshotSourceMap = (Map<String, ColumnSource<?>>) snapshot.getColumnSourceMap();
+
+        if (resultSourceMap.keySet().equals(snapshotSourceMap.keySet())){
+            for(String colName: resultSourceMap.keySet()) {
+                if (resultSourceMap.get(colName).getType() != snapshotSourceMap.get(colName).getType()) {
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+        return true;
+    }
+
     /**
      * Process all the added rows, potentially using previous values.
      *
@@ -256,11 +283,15 @@ public class PriceBook {
             final ChunkSource.FillContext sizefc    = ctx.makeFillContext(sizeSource);
             final ChunkSource.FillContext esizefc   = ctx.makeFillContext(execSizeSource);
             final ChunkSource.FillContext opfc      = ctx.makeFillContext(opSource);
+
             // fc for pass through cols
-            ChunkSource.FillContext[] passfcs = new ChunkSource.FillContext[this.passThroughSources.length];
-            Arrays.stream(this.passThroughSources).map(colSource -> ctx.makeFillContext(colSource));
+            final ChunkSource.FillContext[] passfcs = Arrays.stream(this.passThroughSources)
+                    .map(colSource -> ctx.makeFillContext(colSource)).toArray(ChunkSource.FillContext[]::new);
 
             final Instant timeNow = Instant.now();
+            long seconds = timeNow.getEpochSecond();
+            int nanos = timeNow.getNano();
+            final long nowNanos = seconds * 1_000_000_000L + nanos;
 
             // Now process the entire added index in chunks of CHUNK_SIZE (2048) rows.
             while(okit.hasMore()) {
@@ -317,7 +348,7 @@ public class PriceBook {
                                 // Get rest of order data
                                 final int size = ctx.sizeChunk.get(chunkI);
 
-                                this.addOrder(ctx, ordId, size, timeNow, chunkI);
+                                this.addOrder(ctx, ordId, size, nowNanos, chunkI);
                             }
                         }
 
@@ -348,14 +379,14 @@ public class PriceBook {
                             final long existingOrderRow = orderMap.get(ordId);
 
                             // If ord_id exists, we only change the qty
-                            if (existingOrderRow != -1) {
+                            if (existingOrderRow != -1 || prevOrderId == ordId) {
                                 this.modifyOrder(ctx, size, existingOrderRow, true, timeNow);
 
                             // If ord_id doesn't exist, we create a new order and remove the old order
                             // which has current prev_ord_id as its ord_id.
                             } else {
 
-                                this.addOrder(ctx, ordId, size, timeNow, chunkI);
+                                this.addOrder(ctx, ordId, size, nowNanos, chunkI);
 
                                 if (prevOrderId != 0) {
                                     this.removeOrder(ctx, prevOrderId);
@@ -365,9 +396,9 @@ public class PriceBook {
                     }
                 }
             }
-            resultUpdate.added = RowSetFactory.fromKeys(ctx.rowsAdded.toLongArray());
-            resultUpdate.removed = RowSetFactory.fromKeys(ctx.rowsRemoved.toLongArray());
-            resultUpdate.modified = RowSetFactory.fromKeys(ctx.rowsModified.toLongArray());
+            resultUpdate.added = RowSetFactory.fromKeys(ctx.getAdded().toLongArray());
+            resultUpdate.removed = RowSetFactory.fromKeys(ctx.getRemoved().toLongArray());
+            resultUpdate.modified = RowSetFactory.fromKeys(ctx.getModified().toLongArray());
         }
     }
 
@@ -381,10 +412,10 @@ public class PriceBook {
      * @param timeNow the time the order is updated in the book
      *
      */
-    private void addOrder(Context ctx,
+    private void addOrder(BaseContext ctx,
                           long orderId,
                           int size,
-                          Instant timeNow,
+                          long timeNow,
                           int chunkI) {
         long rowOfAdded;
         boolean inRemoved;
@@ -397,11 +428,11 @@ public class PriceBook {
             // If it was, remove from removed rowset
             // A remove followed by an add is a mod
             // Otherwise, just add to added rowset
-            inRemoved = ctx.rowsRemoved.remove(rowOfAdded);
+            inRemoved = ctx.getRemoved().remove(rowOfAdded);
             if (inRemoved) {
-                ctx.rowsModified.add(rowOfAdded);
+                ctx.getModified().add(rowOfAdded);
             } else {
-                ctx.rowsAdded.add(rowOfAdded);
+                ctx.getAdded().add(rowOfAdded);
             }
 
         } else {
@@ -416,8 +447,7 @@ public class PriceBook {
                 this.passThroughResults[ii].ensureCapacity(resultSize);
             }
 
-
-            ctx.rowsAdded.add(rowOfAdded);
+            ctx.getAdded().add(rowOfAdded);
         }
 
         //Add map from id to row num
@@ -431,16 +461,16 @@ public class PriceBook {
             Class<?> colType = this.passThroughClasses[ii];
 
             if (colType == Instant.class || colType == long.class) {
-                this.passThroughResults[ii].set(rowOfAdded, ((WritableLongChunk) ctx.passChunks[ii]).get(chunkI));
+                this.passThroughResults[ii].set(rowOfAdded, ((WritableLongChunk<?>) ctx.getPassThroughChunks()[ii]).get(chunkI));
 
             } else if (colType == String.class){
-                this.passThroughResults[ii].set(rowOfAdded, ((WritableObjectChunk<String, ?>) ctx.passChunks[ii]).get(chunkI));
+                this.passThroughResults[ii].set(rowOfAdded, ((WritableObjectChunk<String, ?>) ctx.getPassThroughChunks()[ii]).get(chunkI));
 
             } else if (colType == double.class) {
-                this.passThroughResults[ii].set(rowOfAdded, ((WritableDoubleChunk) ctx.passChunks[ii]).get(chunkI));
+                this.passThroughResults[ii].set(rowOfAdded, ((WritableDoubleChunk<?>) ctx.getPassThroughChunks()[ii]).get(chunkI));
 
             } else if (colType == int.class) {
-                this.passThroughResults[ii].set(rowOfAdded, ((WritableIntChunk) ctx.passChunks[ii]).get(chunkI));
+                this.passThroughResults[ii].set(rowOfAdded, ((WritableIntChunk<?>) ctx.getPassThroughChunks()[ii]).get(chunkI));
 
             } else {
                 throw new IllegalArgumentException("Invalid input column type: " + colType);
@@ -462,12 +492,12 @@ public class PriceBook {
         if (rowOfRemoved != -1){
             // Only add to removed rowset if this was not added in this cycle
             // otherwise just remove from added
-            inAdded = ctx.rowsAdded.remove(rowOfRemoved);
+            inAdded = ctx.getAdded().remove(rowOfRemoved);
             if (!inAdded) {
-                ctx.rowsRemoved.add(rowOfRemoved);
+                ctx.getRemoved().add(rowOfRemoved);
             }
 
-            ctx.rowsModified.remove(rowOfRemoved);
+            ctx.getModified().remove(rowOfRemoved);
             availableRows.enqueue(rowOfRemoved);
         }
     }
@@ -479,6 +509,7 @@ public class PriceBook {
      * @param size the order to subtract from the current size
      * @param orderRow the row key to be modified
      * @param replace whether to replace or subtract the size from the original size
+     * @param timeNow the time this will be updated
      *
      */
     private void modifyOrder(Context ctx, int size, long orderRow, boolean replace, Instant timeNow) {
@@ -494,17 +525,30 @@ public class PriceBook {
 
         // Only add to mods if this rowI was not already added this cycle
         // If this row was added in this cycle, then this mod should be considered just an add (do nothing)
-        if (!ctx.rowsAdded.contains(orderRow)) {
-            ctx.rowsModified.add(orderRow);
+        if (!ctx.getAdded().contains(orderRow)) {
+            ctx.getModified().add(orderRow);
         }
     }
 
+    /**
+     * Base context so we can use the order functions on either Init or regular Contexts
+     */
+    private interface BaseContext extends SafeCloseable {
+        // Keep track of rows added, removed, or modified so that the result index can be updated and a downstream
+        // update can be fired to anything listening to the result table.
+        WritableChunk<?>[] getPassThroughChunks();
+        LongOpenHashSet getAdded();
+        LongOpenHashSet getRemoved();
+        LongOpenHashSet getModified();
+
+        ChunkSource.FillContext makeFillContext(ChunkSource<?> cs);
+    }
 
     /**
      * This class holds various objects that are used during an update cycle.  This includes chunks for holding and processing
-     * the updates, as well as the counts of rows added and a buffer for logging sorted prices.
+     * the updates, as well as the counts of rows added, removed and modified this update cycle.
      */
-    private static class Context implements SafeCloseable {
+    private class Context implements BaseContext {
         /*
          * Each of these WriteableChunks are used to process the update data more efficiently in linear chunks
          * instead of iterating over an index.  This avoids virtual method calls and is much more cache-friendly
@@ -516,7 +560,11 @@ public class PriceBook {
         final WritableIntChunk<?> opChunk;
         // Map string to chunk or Array of chunks?
 
-        WritableChunk[] passChunks;
+        WritableChunk<?>[] passChunks;
+
+        LongOpenHashSet rowsAdded = new LongOpenHashSet();
+        LongOpenHashSet rowsRemoved = new LongOpenHashSet();
+        LongOpenHashSet rowsModified = new LongOpenHashSet();
 
         /*
          * The SharedContext and FillContexts are used by the column sources when they copy data into the chunks
@@ -525,11 +573,6 @@ public class PriceBook {
         final SharedContext sc;
         final List<ChunkSource.FillContext> fillContexts = new ArrayList<>(6);
 
-        // Keep track of rows added, removed, or modified so that the result index can be updated and a downstream
-        // update can be fired to anything listening to the result table.
-        LongOpenHashSet rowsAdded = new LongOpenHashSet();
-        LongOpenHashSet rowsRemoved = new LongOpenHashSet();
-        LongOpenHashSet rowsModified = new LongOpenHashSet();
 
         Context(Class<?>[] passThroughClasses) {
             sc = SharedContext.makeSharedContext();
@@ -553,7 +596,7 @@ public class PriceBook {
                     passChunks[ii] = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
 
                 } else if (colType == double.class) {
-                    passChunks[ii] =WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
+                    passChunks[ii] = WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
 
                 } else if (colType == int.class) {
                     passChunks[ii] = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
@@ -562,6 +605,22 @@ public class PriceBook {
                     throw new IllegalArgumentException("Invalid input column type: " + colType);
                 }
             }
+        }
+
+        public LongOpenHashSet getAdded() {
+            return this.rowsAdded;
+        }
+
+        public LongOpenHashSet getRemoved() {
+            return this.rowsRemoved;
+        }
+
+        public LongOpenHashSet getModified() {
+            return this.rowsModified;
+        }
+
+        public WritableChunk[] getPassThroughChunks() {
+            return this.passChunks;
         }
 
         /**
@@ -586,12 +645,189 @@ public class PriceBook {
          * @param cs the column source
          * @return a new fill context for that source.
          */
-        ChunkSource.FillContext makeFillContext(ChunkSource<?> cs) {
+        public ChunkSource.FillContext makeFillContext(ChunkSource<?> cs) {
             final ChunkSource.FillContext fc = cs.makeFillContext(CHUNK_SIZE, sc);
             fillContexts.add(fc);
             return fc;
         }
     }
+
+
+    /**
+     * processInitBook and InitContext are specifically for processesing a snapshot
+     * Process all rows from a book table snapshot
+     *
+     * @param t the snapshot of the book table
+     * @param resultUpdate the update object that will be used in the listener to push out the added, removed,
+     *                     and modified RowSets
+     */
+    final void processInitBook(final Table t, TableUpdateImpl resultUpdate) {
+        // Must be static
+        assert !t.isRefreshing();
+
+        final ColumnSource<Long> updateTimeSource = ReinterpretUtils.instantToLongSource(t.getColumnSource(UPDATE_TIME_NAME));
+        final ColumnSource<Long> ordIdSource = t.getColumnSource(ORDID_NAME);
+        final ColumnSource<Double> sizeSource = t.getColumnSource(SIZE_NAME);
+
+        // Get the sources from the snapshot.
+        // Special care of Instants
+        ColumnSource<?>[] snapPassSources = (ColumnSource<?>[]) Arrays.stream(this.passThroughColNames)
+                .map(colName ->
+                        (ColumnSource<?>) ((Class<?>) t.getColumnSource(colName).getType() == Instant.class ?
+                                ReinterpretUtils.instantToLongSource(t.getColumnSource(colName)) :
+                                t.getColumnSource(colName))
+                ).toArray(ColumnSource<?>[]::new);
+
+
+        try(final InitContext context = new InitContext(passThroughClasses)) {
+            // Next we get an iterator into the added index so that we can process the update in chunks.
+            final RowSequence.Iterator okit = t.getRowSet().getRowSequenceIterator();
+
+            final ChunkSource.FillContext uptimefc  = context.makeFillContext(updateTimeSource);
+            final ChunkSource.FillContext oidfc     = context.makeFillContext(ordIdSource);
+            final ChunkSource.FillContext sizefc    = context.makeFillContext(sizeSource);
+
+            final ChunkSource.FillContext[] passfcs = Arrays.stream(snapPassSources)
+                    .map(colSource -> context.makeFillContext(colSource)).toArray(ChunkSource.FillContext[]::new);
+
+
+            while (okit.hasMore()) {
+                context.sc.reset();
+
+                // Grab up to the next CHUNK_SIZE rows
+                final RowSequence nextKeys = okit.getNextRowSequenceWithLength(CHUNK_SIZE);
+
+                updateTimeSource.fillChunk(uptimefc, (WritableChunk<? super Values>) context.updateTimeChunk, nextKeys);
+                ordIdSource.fillChunk(oidfc, (WritableChunk<? super Values>) context.idChunk, nextKeys);
+                sizeSource.fillChunk(sizefc, (WritableChunk<? super Values>) context.sizeChunk, nextKeys);
+
+                for(int ii = 0; ii < snapPassSources.length; ii++) {
+                    snapPassSources[ii].fillChunk(passfcs[ii],
+                            (WritableChunk<? super Values>) context.getPassThroughChunks()[ii], nextKeys);
+                }
+
+
+                for(int chunkI = 0; chunkI< nextKeys.size(); chunkI++) {
+                    // Get some minimal data
+                    final long updateTime = context.updateTimeChunk.get(chunkI);
+                    final long ordId = context.idChunk.get(chunkI);
+                    final int size = context.sizeChunk.get(chunkI);
+
+                    // Add every order
+                    // addOrder needs to accept both Contexts
+                    this.addOrder(context, ordId, size, updateTime, chunkI);
+                }
+            }
+
+            // We are only adding rows when initing from snapshot
+            resultUpdate.added = RowSetFactory.fromKeys(context.rowsAdded.toLongArray());
+        }
+    }
+
+    /**
+     * Specific context for processes a book snapshot
+     */
+    private class InitContext implements BaseContext {
+        /*
+         * Each of these WriteableChunks are used to process the update data more efficiently in linear chunks
+         * instead of iterating over an index.  This avoids virtual method calls and is much more cache-friendly
+         */
+        final WritableLongChunk<?> updateTimeChunk;
+        final WritableLongChunk<?> idChunk;
+        final WritableLongChunk<?> orderTimeChunk;
+        final WritableIntChunk<?> sizeChunk;
+
+        WritableChunk<?>[] passChunks;
+
+        LongOpenHashSet rowsAdded = new LongOpenHashSet();
+        LongOpenHashSet rowsRemoved = new LongOpenHashSet();
+        LongOpenHashSet rowsModified = new LongOpenHashSet();
+
+
+        /*
+         * The SharedContext and FillContexts are used by the column sources when they copy data into the chunks
+         * above in order to share resources within a single update cycle.
+         */
+        final SharedContext sc;
+        final List<ChunkSource.FillContext> fillContexts = new ArrayList<>(7);
+
+        InitContext(Class<?>[] passThroughClasses) {
+            sc = SharedContext.makeSharedContext();
+
+            updateTimeChunk = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            idChunk         = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            orderTimeChunk  = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+            sizeChunk       = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+
+            passChunks = new WritableChunk[passThroughClasses.length];
+
+            // Add in the pass through column sources
+            for(int ii = 0; ii < passThroughClasses.length; ii++) {
+                Class<?> colType = passThroughClasses[ii];
+
+                if (colType == Instant.class || colType == long.class) {
+                    passChunks[ii] = WritableLongChunk.makeWritableChunk(CHUNK_SIZE);
+
+                } else if (colType == String.class){
+                    passChunks[ii] = WritableObjectChunk.makeWritableChunk(CHUNK_SIZE);
+
+                } else if (colType == double.class) {
+                    passChunks[ii] =WritableDoubleChunk.makeWritableChunk(CHUNK_SIZE);
+
+                } else if (colType == int.class) {
+                    passChunks[ii] = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+
+                } else {
+                    throw new IllegalArgumentException("Invalid input column type: " + colType);
+                }
+            }
+
+        }
+
+        public LongOpenHashSet getAdded() {
+            return this.rowsAdded;
+        }
+
+        public LongOpenHashSet getRemoved() {
+            return this.rowsRemoved;
+        }
+
+        public LongOpenHashSet getModified() {
+            return this.rowsModified;
+        }
+
+        public WritableChunk<?>[] getPassThroughChunks() {
+            return this.passChunks;
+        }
+
+        /**
+         * At the end of an update cycle this must be invoked to close and release any shared resources that were claimed
+         * during the update cycle.
+         */
+        @Override
+        public void close() {
+            sc.close();
+            fillContexts.forEach(ChunkSource.FillContext::close);
+            Arrays.stream(passChunks).forEach(SafeCloseable::close);
+            updateTimeChunk.close();
+            idChunk.close();
+            orderTimeChunk.close();
+            sizeChunk.close();
+        }
+
+        /**
+         * Just a helper method to create fill contexts and save them so they can be cleaned up neatly on close.
+         *
+         * @param cs the column source
+         * @return a new fill context for that source.
+         */
+        public ChunkSource.FillContext makeFillContext(ChunkSource<?> cs) {
+            final ChunkSource.FillContext fc = cs.makeFillContext(CHUNK_SIZE, sc);
+            fillContexts.add(fc);
+            return fc;
+        }
+    }
+
 
     /**
      * This class listens for updates from the source table and pushes each row through the BookState for the symbol
@@ -654,9 +890,6 @@ public class PriceBook {
                     resultUpdate.modifiedColumnSet = ModifiedColumnSet.ALL;
                 }
 
-                // Handle the case where the input rows generate no book state changes,  we don't want to accidentally
-                // try to inject a -1 into the row set.
-
             } else {
                 resultUpdate.added = RowSetFactory.empty();
                 resultUpdate.removed = RowSetFactory.empty();
@@ -707,14 +940,19 @@ public class PriceBook {
      * Build a book of current live orders and their status
      *
      * @param source the table with the source data
+     * @param snapshot the optional snapshot to resume from
      * @param idColumnName the name of the source order id column
+     * @param prevIdColumnName the name of the prev id column
      * @param sizeColumnName the name of the source size column
+     * @param execSizeColumnName the name of the execution size column
      * @param opColumnName the name of the source book-op column
+     * @param passThroughCols a list of column names to be pass through from to source to the book
      *
      * @return a new table representing the current state of the book.  This table will update as the source table updates.
      */
     @SuppressWarnings("unused")
     public static QueryTable build(@NotNull Table source,
+                                   Table snapshot,
                                    @NotNull String idColumnName,
                                    @NotNull String prevIdColumnName,
                                    @NotNull String sizeColumnName,
@@ -723,6 +961,7 @@ public class PriceBook {
                                    @NotNull String... passThroughCols
                                    ) {
         final PriceBook book = new PriceBook(source,
+                snapshot,
                 idColumnName,
                 prevIdColumnName,
                 sizeColumnName,
