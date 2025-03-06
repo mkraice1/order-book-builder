@@ -2,6 +2,14 @@ plugins {
     id 'groovy'
     id 'java-library'
     id 'idea'
+    id 'checkstyle'
+}
+
+checkstyle {
+    toolVersion = '10.12.0' // Use latest stable version
+    configFile = file("${rootDir}/config/checkstyle/checkstyle.xml") // Path to your custom XML
+    ignoreFailures = false // Set to true if you don't want the build to fail on warnings
+    showViolations = true  // Show errors in the console
 }
 
 group 'io.deephaven'
