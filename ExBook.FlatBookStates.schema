@@ -1,0 +1,37 @@
+<Table name="FlatBook" namespace="BookStates" defaultMergeFormat="DeephavenV1" storageType="NestedPartitionedOnDisk">
+  <Partitions keyFormula="${autobalance_by_first_grouping_column}" />
+
+  <Column name="Date" dataType="String" columnType="Partitioning" />
+  <Column name="SnapTime" dataType="DateTime"/>
+  <Column name="LastTickTime" dataType="DateTime"/>
+
+  <Column name="UpdateTimestamp" dataType="DateTime"/>
+  <Column name="OrderId" dataType="long"/>
+  <Column name="Size" dataType="int"/>
+
+
+  <Column name="SYMB" dataType="String"/>
+  <Column name="PRC" dataType="double"/>
+  <Column name="SIDE" dataType="int"/>
+  <Column name="EPOCH_TS" dataType="DateTime"/>
+
+
+  <Listener logFormat="1" listenerPackage="io.deephaven.crashcourse.dynamic.gen" listenerClass="LoggingDateFormat1Listener"
+                    rethrowLoggerExceptionsAsIOExceptions="false">
+
+    <Column name="Date" intradayType="none" />
+    <Column name="SnapTime" dbSetter="DBTimeUtils.nanosToTime(SnapTime)"/>
+    <Column name="LastTickTime" dbSetter="DBTimeUtils.nanosToTime(LastTickTime)"/>
+
+    <Column name="UpdateTimestamp" dbSetter="DBTimeUtils.nanosToTime(UpdateTimestamp)"/>
+    <Column name="OrderId" />
+    <Column name="Size" />
+    
+    <Column name="SYMB"/>
+    <Column name="PRC"/>
+    <Column name="SIDE"/>
+    <Column name="EPOCH_TS" dbSetter="DBTimeUtils.nanosToTime(EPOCH_TS)"/>
+
+  </Listener>
+
+</Table>
