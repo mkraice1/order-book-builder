@@ -1,7 +1,7 @@
-package io.deephaven.book;
+package p.deephaven.book;
 
 public final class MutableObject<T> {
-    private T value = null;
+    private T value;
 
     public void set(T val) {
         this.value = val;

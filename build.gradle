@@ -2,10 +2,18 @@ plugins {
     id 'groovy'
     id 'java-library'
     id 'idea'
+    id 'checkstyle'
+}
+
+checkstyle {
+    toolVersion = '10.12.0' // Use latest stable version
+    configFile = file("${rootDir}/config/checkstyle/checkstyle.xml") // Path to your custom XML
+    ignoreFailures = false // Set to true if you don't want the build to fail on warnings
+    showViolations = true  // Show errors in the console
 }
 
 group 'io.deephaven'
-version "1.0-${dhcVersion}"
+version "1.4-${dhcVersion}"
 
 allprojects {
     repositories {
@@ -25,11 +33,16 @@ java {
 }
 
 dependencies {
+
     implementation platform("io.deephaven:deephaven-bom:${dhcVersion}"),
                    "io.deephaven:deephaven-engine-table",
                    "it.unimi.dsi:fastutil:8.5.13"
     runtimeOnly "io.deephaven:deephaven-log-to-slf4j",
-                'ch.qos.logback:logback-classic:1.4.5'
+                'ch.qos.logback:logback-classic:1.4.12'
+//    testImplementation("io.deephaven:deephaven-engine:0.36.1")
+    testImplementation("io.deephaven:deephaven-engine-table:0.36.1")
+    testImplementation("io.deephaven:deephaven-engine-test-utils:0.36.1")
+
 }
 
 jar {
