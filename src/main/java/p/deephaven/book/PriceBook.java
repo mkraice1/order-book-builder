@@ -1,6 +1,6 @@
 package p.deephaven.book;
 
-import io.deephaven.base.log.LogOutput;
+import io.deephaven.chunk.WritableCharChunk;
 import io.deephaven.chunk.WritableChunk;
 import io.deephaven.chunk.WritableDoubleChunk;
 import io.deephaven.chunk.WritableIntChunk;
@@ -26,13 +26,13 @@ import io.deephaven.engine.table.impl.MergedListener;
 import io.deephaven.engine.table.impl.OperationSnapshotControl;
 import io.deephaven.engine.table.impl.QueryTable;
 import io.deephaven.engine.table.impl.TableUpdateImpl;
+import io.deephaven.engine.table.impl.sources.CharacterArraySource;
 import io.deephaven.engine.table.impl.sources.DoubleArraySource;
 import io.deephaven.engine.table.impl.sources.InstantArraySource;
 import io.deephaven.engine.table.impl.sources.IntegerArraySource;
 import io.deephaven.engine.table.impl.sources.LongArraySource;
 import io.deephaven.engine.table.impl.sources.ObjectArraySource;
 import io.deephaven.engine.table.impl.sources.ReinterpretUtils;
-import io.deephaven.io.log.impl.LogOutputStringImpl;
 import io.deephaven.util.SafeCloseable;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
@@ -66,8 +66,6 @@ import java.util.Map;
  *
  * <p></p>
  * <p>
- *
- *
  */
 public class PriceBook {
     private static final int CHUNK_SIZE = 2048;
@@ -176,6 +174,9 @@ public class PriceBook {
 
             } else if (colType == int.class) {
                 passColResultSource = new IntegerArraySource();
+
+            } else if (colType == char.class) {
+                passColResultSource = new CharacterArraySource();
 
             } else {
                 throw new IllegalArgumentException(passColName + " is an invalid input column type: " + colType);
@@ -492,6 +493,9 @@ public class PriceBook {
             } else if (colType == int.class) {
                 this.passThroughResults[ii].set(rowOfAdded, ((WritableIntChunk<?>) ctx.getPassThroughChunks()[ii]).get(chunkI));
 
+            } else if (colType == char.class) {
+                this.passThroughResults[ii].set(rowOfAdded, ((WritableCharChunk<?>) ctx.getPassThroughChunks()[ii]).get(chunkI));
+
             } else {
                 throw new IllegalArgumentException("Invalid input column type: " + colType);
             }
@@ -622,6 +626,9 @@ public class PriceBook {
 
                 } else if (colType == int.class) {
                     passChunks[ii] = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
+
+                }  else if (colType == char.class) {
+                    passChunks[ii] = WritableCharChunk.makeWritableChunk(CHUNK_SIZE);
 
                 } else {
                     throw new IllegalArgumentException("Invalid input column type: " + colType);
@@ -794,6 +801,9 @@ public class PriceBook {
                 } else if (colType == int.class) {
                     passChunks[ii] = WritableIntChunk.makeWritableChunk(CHUNK_SIZE);
 
+                } else if (colType == char.class) {
+                    passChunks[ii] = WritableCharChunk.makeWritableChunk(CHUNK_SIZE);
+
                 } else {
                     throw new IllegalArgumentException("Invalid input column type: " + colType);
                 }
@@ -919,36 +929,6 @@ public class PriceBook {
             // update for any downstream listeners of the result table.
             resultTable.notifyListeners(resultUpdate);
         }
-    }
-
-    // Helper function to print out an update object for debugging
-    private String printUpdate(TableUpdateImpl update) {
-        final RowSet removalsMinusPrevious = update.removed().minus(resultIndex.copyPrev());
-        final RowSet addedMinusCurrent = update.added().minus(resultIndex);
-        final RowSet removedIntersectCurrent = update.removed().intersect(resultIndex);
-        final RowSet modifiedMinusCurrent = update.modified().minus(resultIndex);
-
-        final RowSet addedIntersectPrevious = update.added().intersect(resultIndex.copyPrev());
-        final RowSet modifiedMinusPrevious = update.modified().minus(resultIndex.copyPrev());
-
-        // Everything is messed up for this table, print out the indices in an easy to understand way
-        final LogOutput logOutput = new LogOutputStringImpl()
-                .append("RowSet update: ")
-                .append(LogOutput::nl).append("\t          previousIndex=").append(resultIndex.copyPrev())
-                .append(LogOutput::nl).append("\t           currentIndex=").append(resultIndex)
-                .append(LogOutput::nl).append("\t                  added=").append(update.added())
-                .append(LogOutput::nl).append("\t                removed=").append(update.removed())
-                .append(LogOutput::nl).append("\t               modified=").append(update.modified())
-                .append(LogOutput::nl).append("\t           modifiedCols=").append(update.modifiedColumnSet().toString())
-                .append(LogOutput::nl).append("\t                shifted=").append(update.shifted().toString())
-                .append(LogOutput::nl).append("\t  removalsMinusPrevious=").append(removalsMinusPrevious)
-                .append(LogOutput::nl).append("\t      addedMinusCurrent=").append(addedMinusCurrent)
-                .append(LogOutput::nl).append("\t   modifiedMinusCurrent=").append(modifiedMinusCurrent)
-                .append(LogOutput::nl).append("\tremovedIntersectCurrent=").append(removedIntersectCurrent)
-                .append(LogOutput::nl).append("\t addedIntersectPrevious=").append(addedIntersectPrevious)
-                .append(LogOutput::nl).append("\t  modifiedMinusPrevious=").append(modifiedMinusPrevious);
-
-        return logOutput.toString();
     }
 
     /**

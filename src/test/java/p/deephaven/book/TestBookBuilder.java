@@ -1,28 +1,22 @@
-package io.deephaven.book;
+package p.deephaven.book;
 
-import io.deephaven.engine.table.impl.sources.*;
-import io.deephaven.engine.table.impl.util.AsyncClientErrorNotifier;
 import io.deephaven.engine.table.Table;
-import io.deephaven.engine.table.impl.QueryTable;
-import io.deephaven.engine.testutil.TstUtils;
+import io.deephaven.engine.table.impl.util.AsyncClientErrorNotifier;
 import io.deephaven.engine.util.TableTools;
 import junit.framework.TestCase;
-import org.junit.BeforeClass;
-import org.junit.After;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
-
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-
-import static io.deephaven.util.QueryConstants.NULL_LONG;
-import static io.deephaven.util.QueryConstants.NULL_INT;
-
 import java.time.Instant;
+import java.util.concurrent.ExecutionException;
 
-import static io.deephaven.engine.util.TableTools.*;
+import static io.deephaven.engine.util.TableTools.doubleCol;
+import static io.deephaven.engine.util.TableTools.instantCol;
+import static io.deephaven.engine.util.TableTools.intCol;
+import static io.deephaven.engine.util.TableTools.longCol;
+import static io.deephaven.engine.util.TableTools.stringCol;
+import static io.deephaven.util.QueryConstants.NULL_INT;
+import static io.deephaven.util.QueryConstants.NULL_LONG;
 
 public class TestBookBuilder {
     private static final String UPDATE_TIME_NAME = "UpdateTimestamp";
@@ -73,9 +67,9 @@ public class TestBookBuilder {
 
     @Test
     public void testSimple() throws InterruptedException, ExecutionException {
-        resultBook = PriceBook.build(exSource, "ORD_ID", "PREV_ORD_ID",
-                "SYMB", "EPOCH_TS", "PRC", "QTY",
-                "EXEC_QTY", "SIDE", "EVT_ID");
+        resultBook = PriceBook.build(exSource, null, "ORD_ID",
+                 "POREV_ORD_ID", "QTY",
+                "EXEC_QTY", "EVT_ID", "SIDE",  "SYMB", "EPOCH_TS", "PRC");
 
         // Hard to verify the exact instant something got updated...
         resultBook = resultBook.dropColumns("UpdateTimestamp");
