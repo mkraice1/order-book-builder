@@ -13,7 +13,7 @@ checkstyle {
 }
 
 group 'io.deephaven'
-version "1.6-${dhcVersion}"
+version "1.5-${dhcVersion}"
 
 allprojects {
     repositories {
