@@ -25,7 +25,7 @@ import threading
 import time
 
 
-_J_BookBuilder = jpy.get_type("p.deephaven.book.PriceBook")
+_J_BookBuilder = jpy.get_type("io.deephaven.book.PriceBook")
 
 
 def build_book(source: Table,

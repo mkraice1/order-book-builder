@@ -1,4 +1,4 @@
-package p.deephaven.book;
+package io.deephaven.book;
 
 import io.deephaven.engine.table.Table;
 import io.deephaven.engine.table.impl.util.AsyncClientErrorNotifier;

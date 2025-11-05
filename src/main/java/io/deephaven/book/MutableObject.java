@@ -1,4 +1,4 @@
-package p.deephaven.book;
+package io.deephaven.book;
 
 public final class MutableObject<T> {
     private T value;

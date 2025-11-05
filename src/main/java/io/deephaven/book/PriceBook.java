@@ -1,4 +1,4 @@
-package p.deephaven.book;
+package io.deephaven.book;
 
 import io.deephaven.chunk.WritableCharChunk;
 import io.deephaven.chunk.WritableChunk;
